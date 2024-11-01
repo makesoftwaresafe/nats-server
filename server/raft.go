@@ -480,11 +480,6 @@ func (s *Server) initRaftNode(accName string, cfg *RaftConfig, labels pprofLabel
 				}
 			}
 		}
-	} else if n.pterm == 0 && n.pindex == 0 {
-		// We have recovered no state, either through our WAL or snapshots,
-		// so inherit from term from our tav.idx file and pindex from our last sequence.
-		n.pterm = n.term
-		n.pindex = state.LastSeq
 	}
 
 	// Make sure to track ourselves.
@@ -3191,7 +3186,7 @@ func (n *raft) truncateWAL(term, index uint64) {
 	defer func() {
 		// Check to see if we invalidated any snapshots that might have held state
 		// from the entries we are truncating.
-		if snap, _ := n.loadLastSnapshot(); snap != nil && snap.lastIndex >= index {
+		if snap, _ := n.loadLastSnapshot(); snap != nil && snap.lastIndex > index {
 			os.Remove(n.snapfile)
 			n.snapfile = _EMPTY_
 		}
@@ -4228,7 +4223,9 @@ func (n *raft) switchToCandidate() {
 	defer n.Unlock()
 
 	// If we are catching up or are in observer mode we can not switch.
-	if n.observer || n.paused {
+	// Avoid petitioning to become leader if we're behind on applies.
+	if n.observer || n.paused || n.applied < n.commit {
+		n.resetElect(minElectionTimeout / 4)
 		return
 	}
 

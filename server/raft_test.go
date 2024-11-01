@@ -20,6 +20,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 	"time"
@@ -1451,5 +1452,168 @@ func TestNRGCatchupFromNewLeaderWithIncorrectPtermDoesNotTruncateIfCommitted(t *
 	n.processAppendEntry(aeHeartbeat2, n.aesub)
 	require_Equal(t, n.commit, 2)
 	require_True(t, n.catchup == nil)
+}
 
+func TestNRGDontRemoveSnapshotIfTruncateToApplied(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Timeline.
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+
+	// Initial case is simple, just store the entry.
+	n.processAppendEntry(aeMsg, n.aesub)
+	require_Equal(t, n.wal.State().Msgs, 1)
+	entry, err := n.loadEntry(1)
+	require_NoError(t, err)
+	require_Equal(t, entry.leader, nats0)
+
+	// Heartbeat, makes sure commit moves up.
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	require_Equal(t, n.commit, 1)
+	require_Equal(t, n.pterm, 1)
+
+	// Simulate upper layer calling down to apply.
+	n.Applied(1)
+
+	// Install snapshot and check it exists.
+	err = n.InstallSnapshot(nil)
+	require_NoError(t, err)
+
+	snapshots := path.Join(n.sd, snapshotsDir)
+	files, err := os.ReadDir(snapshots)
+	require_NoError(t, err)
+	require_Equal(t, len(files), 1)
+
+	// Truncate and check snapshot is kept.
+	n.truncateWAL(n.pterm, n.applied)
+
+	files, err = os.ReadDir(snapshots)
+	require_NoError(t, err)
+	require_Equal(t, len(files), 1)
+}
+
+func TestNRGDontSwitchToCandidateWithInflightSnapshot(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample snapshot entry, the content doesn't matter.
+	snapshotEntries := []*Entry{
+		newEntry(EntrySnapshot, nil),
+		newEntry(EntryPeerState, encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})),
+	}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Timeline.
+	aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+	aeCatchupSnapshot := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: snapshotEntries})
+
+	// Switch follower into catchup.
+	n.processAppendEntry(aeTriggerCatchup, n.aesub)
+	require_True(t, n.catchup != nil)
+	require_Equal(t, n.catchup.pterm, 0)  // n.pterm
+	require_Equal(t, n.catchup.pindex, 0) // n.pindex
+
+	// Follower receives a snapshot, marking a snapshot as inflight as the apply queue is async.
+	n.processAppendEntry(aeCatchupSnapshot, n.catchup.sub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.commit, 1)
+
+	// Try to switch to candidate, it should be blocked since the snapshot is not processed yet.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+
+	// Simulate snapshot being processed by the upper layer.
+	n.Applied(1)
+
+	// Retry becoming candidate, snapshot is processed so can now do so.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+}
+
+func TestNRGDontSwitchToCandidateWithMultipleInflightSnapshots(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample snapshot entry, the content doesn't matter.
+	snapshotEntries := []*Entry{
+		newEntry(EntrySnapshot, nil),
+		newEntry(EntryPeerState, encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})),
+	}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Timeline.
+	aeSnapshot1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: snapshotEntries})
+	aeSnapshot2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: snapshotEntries})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 2, entries: nil})
+
+	// Simulate snapshots being sent to us.
+	n.processAppendEntry(aeSnapshot1, n.aesub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.commit, 0)
+	require_Equal(t, n.applied, 0)
+
+	n.processAppendEntry(aeSnapshot2, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	require_Equal(t, n.commit, 1)
+	require_Equal(t, n.applied, 0)
+
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	require_Equal(t, n.commit, 2)
+	require_Equal(t, n.applied, 0)
+
+	for i := uint64(1); i <= 2; i++ {
+		// Try to switch to candidate, it should be blocked since the snapshot is not processed yet.
+		n.switchToCandidate()
+		require_Equal(t, n.State(), Follower)
+
+		// Simulate snapshot being processed by the upper layer.
+		n.Applied(i)
+	}
+
+	// Retry becoming candidate, all snapshots processed so can now do so.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+}
+
+func TestNRGRecoverPindexPtermOnlyIfLogNotEmpty(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.leader(), nats.UserInfo("admin", "s3cr3t!"))
+	defer nc.Close()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	gn := rg[0].(*stateAdder)
+	rn := rg[0].node().(*raft)
+
+	// Delete the msgs and snapshots, leaving the only remaining trace
+	// of the term in the TAV file.
+	store := filepath.Join(gn.cfg.Store)
+	require_NoError(t, rn.wal.Truncate(0))
+	require_NoError(t, os.RemoveAll(filepath.Join(store, "msgs")))
+	require_NoError(t, os.RemoveAll(filepath.Join(store, "snapshots")))
+
+	for _, gn := range rg {
+		gn.stop()
+	}
+	rg[0].restart()
+	rn = rg[0].node().(*raft)
+
+	// Both should be zero as, without any snapshots or log entries,
+	// the log is considered empty and therefore we account as such.
+	require_Equal(t, rn.pterm, 0)
+	require_Equal(t, rn.pindex, 0)
 }
