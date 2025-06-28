@@ -967,6 +967,17 @@ func (fs *fileStore) initMsgBlock(index uint32) *msgBlock {
 	return mb
 }
 
+// Check for encryption, we do not load keys on startup anymore so might need to load them here.
+// Lock for fs should be held.
+func (mb *msgBlock) checkAndLoadEncryption() error {
+	if mb.fs != nil && mb.fs.prf != nil && (mb.aek == nil || mb.bek == nil) {
+		if err := mb.fs.loadEncryptionForMsgBlock(mb); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Lock for fs should be held.
 func (fs *fileStore) loadEncryptionForMsgBlock(mb *msgBlock) error {
 	if fs.prf == nil {
@@ -1966,11 +1977,8 @@ func (mb *msgBlock) lastChecksum() []byte {
 		return lchk[:]
 	}
 	// Encrypted?
-	// Check for encryption, we do not load keys on startup anymore so might need to load them here.
-	if mb.fs != nil && mb.fs.prf != nil && (mb.aek == nil || mb.bek == nil) {
-		if err := mb.fs.loadEncryptionForMsgBlock(mb); err != nil {
-			return nil
-		}
+	if err := mb.checkAndLoadEncryption(); err != nil {
+		return nil
 	}
 	if mb.bek != nil {
 		if buf, _ := mb.loadBlock(nil); len(buf) >= checksumSize {
@@ -2410,10 +2418,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *Sublist, start uint64, sm *StoreMsg) 
 				// mb is already loaded into the cache so should be fast-ish.
 				mb.recalculateForSubj(bytesToString(subj), ss)
 			}
-			first := ss.First
-			if start > first {
-				first = start
-			}
+			first := max(start, ss.First)
 			if first > ss.Last || first >= hseq {
 				// The start cutoff is after the last sequence for this subject,
 				// or we think we already know of a subject with an earlier msg
@@ -2455,7 +2460,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *Sublist, start uint64, sm *StoreMsg) 
 			}
 		})
 		if hseq < uint64(math.MaxUint64) && sm != nil {
-			return sm, didLoad, nil
+			return sm, didLoad && start == lseq, nil
 		}
 	} else {
 		for seq := start; seq <= lseq; seq++ {
@@ -6760,6 +6765,9 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 	// under heavy load.
 
 	// Check if we need to encrypt.
+	if err := mb.checkAndLoadEncryption(); err != nil {
+		return nil, err
+	}
 	if mb.bek != nil && lob > 0 {
 		// Need to leave original alone.
 		var dst []byte
@@ -6946,11 +6954,8 @@ func (mb *msgBlock) loadBlock(buf []byte) ([]byte, error) {
 
 // Lock should be held.
 func (mb *msgBlock) loadMsgsWithLock() error {
-	// Check for encryption, we do not load keys on startup anymore so might need to load them here.
-	if mb.fs != nil && mb.fs.prf != nil && (mb.aek == nil || mb.bek == nil) {
-		if err := mb.fs.loadEncryptionForMsgBlock(mb); err != nil {
-			return err
-		}
+	if err := mb.checkAndLoadEncryption(); err != nil {
+		return err
 	}
 
 	// Check to see if we are loading already.
@@ -7397,6 +7402,24 @@ func (mb *msgBlock) msgFromBufEx(buf []byte, sm *StoreMsg, hh hash.Hash64, doCop
 	}
 
 	return sm, nil
+}
+
+// SubjectForSeq will return what the subject is for this sequence if found.
+func (fs *fileStore) SubjectForSeq(seq uint64) (string, error) {
+	fs.mu.RLock()
+	if seq < fs.state.FirstSeq {
+		fs.mu.RUnlock()
+		return _EMPTY_, ErrStoreMsgNotFound
+	}
+	var smv StoreMsg
+	mb := fs.selectMsgBlock(seq)
+	fs.mu.RUnlock()
+	if mb != nil {
+		if sm, _, _ := mb.fetchMsgNoCopy(seq, &smv); sm != nil {
+			return sm.subj, nil
+		}
+	}
+	return _EMPTY_, ErrStoreMsgNotFound
 }
 
 // LoadMsg will lookup the message by sequence number and return it if found.

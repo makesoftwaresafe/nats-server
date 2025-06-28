@@ -9627,3 +9627,101 @@ func TestFileStoreUpdateConfigTTLState(t *testing.T) {
 	require_NoError(t, fs.UpdateConfig(&cfg))
 	require_Equal(t, fs.ttls, nil)
 }
+
+func TestFileStoreSubjectForSeq(t *testing.T) {
+	cfg := StreamConfig{
+		Name:     "foo",
+		Subjects: []string{"foo.>"},
+		Storage:  FileStorage,
+	}
+	fs, err := newFileStore(FileStoreConfig{StoreDir: t.TempDir()}, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	seq, _, err := fs.StoreMsg("foo.bar", nil, nil, 0)
+	require_NoError(t, err)
+	require_Equal(t, seq, 1)
+
+	_, err = fs.SubjectForSeq(0)
+	require_Error(t, err, ErrStoreMsgNotFound)
+
+	subj, err := fs.SubjectForSeq(1)
+	require_NoError(t, err)
+	require_Equal(t, subj, "foo.bar")
+
+	_, err = fs.SubjectForSeq(2)
+	require_Error(t, err, ErrStoreMsgNotFound)
+}
+
+func BenchmarkFileStoreSubjectAccesses(b *testing.B) {
+	fs, err := newFileStore(FileStoreConfig{StoreDir: b.TempDir()}, StreamConfig{
+		Name:     "foo",
+		Subjects: []string{"foo.>"},
+		Storage:  FileStorage,
+	})
+	require_NoError(b, err)
+	defer fs.Stop()
+
+	seq, _, err := fs.StoreMsg("foo.bar", nil, []byte{1, 2, 3, 4, 5}, 0)
+	require_NoError(b, err)
+	require_Equal(b, seq, 1)
+
+	b.Run("SubjectForSeq", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			subj, err := fs.SubjectForSeq(1)
+			require_NoError(b, err)
+			require_Equal(b, subj, "foo.bar")
+		}
+	})
+
+	b.Run("LoadMsg", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			// smv is deliberately inside the loop here because that's
+			// effectively what is happening with needAck.
+			var smv StoreMsg
+			sm, err := fs.LoadMsg(1, &smv)
+			require_NoError(b, err)
+			require_Equal(b, sm.subj, "foo.bar")
+		}
+	})
+}
+
+func TestFileStoreFirstMatchingMultiExpiry(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.>"}, Storage: FileStorage}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		_, _, err = fs.StoreMsg("foo.foo", nil, []byte("A"), 0)
+		require_NoError(t, err)
+
+		_, _, err = fs.StoreMsg("foo.foo", nil, []byte("B"), 0)
+		require_NoError(t, err)
+
+		_, _, err = fs.StoreMsg("foo.foo", nil, []byte("C"), 0)
+		require_NoError(t, err)
+
+		fs.mu.RLock()
+		mb := fs.lmb
+		mb.expireCacheLocked()
+		fs.mu.RUnlock()
+
+		sl := NewSublistNoCache()
+		sl.Insert(&subscription{subject: []byte("foo.foo")})
+
+		_, didLoad, err := mb.firstMatchingMulti(sl, 1, nil)
+		require_NoError(t, err)
+		require_False(t, didLoad)
+
+		_, didLoad, err = mb.firstMatchingMulti(sl, 2, nil)
+		require_NoError(t, err)
+		require_False(t, didLoad)
+
+		_, didLoad, err = mb.firstMatchingMulti(sl, 3, nil)
+		require_NoError(t, err)
+		require_True(t, didLoad) // last message, should expire
+	})
+}
