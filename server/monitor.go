@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"expvar"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -282,7 +283,9 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 	s.mu.RLock()
 	// Default to all client unless filled in above.
 	if clist == nil {
-		clist = s.clients
+		clist = make(map[uint64]*client, len(s.clients)+len(s.leafs))
+		maps.Copy(clist, s.clients)
+		maps.Copy(clist, s.leafs)
 	}
 
 	// copy the server id for monitoring
@@ -805,8 +808,10 @@ type RouteInfo struct {
 
 // Routez returns a Routez struct containing information about routes.
 func (s *Server) Routez(routezOpts *RoutezOptions) (*Routez, error) {
-	rs := &Routez{Routes: []*RouteInfo{}}
-	rs.Now = time.Now().UTC()
+	rs := &Routez{
+		Now:    time.Now().UTC(),
+		Routes: []*RouteInfo{},
+	}
 
 	if routezOpts == nil {
 		routezOpts = &RoutezOptions{}
@@ -823,7 +828,7 @@ func (s *Server) Routez(routezOpts *RoutezOptions) (*Routez, error) {
 		rs.Import = perms.Import
 		rs.Export = perms.Export
 	}
-	rs.Name = s.getOpts().ServerName
+	rs.Name = s.info.Name
 
 	addRoute := func(r *client) {
 		r.mu.Lock()
@@ -1000,7 +1005,15 @@ func (s *Server) Subsz(opts *SubszOptions) (*Subsz, error) {
 	slStats := &SublistStats{}
 
 	// FIXME(dlc) - Make account aware.
-	sz := &Subsz{s.info.ID, time.Now().UTC(), slStats, 0, offset, limit, nil}
+	sz := &Subsz{
+		ID:           s.info.ID,
+		Now:          time.Now().UTC(),
+		SublistStats: slStats,
+		Total:        0,
+		Offset:       offset,
+		Limit:        limit,
+		Subs:         nil,
+	}
 
 	if subdetail {
 		var raw [4096]*subscription
@@ -1015,7 +1028,7 @@ func (s *Server) Subsz(opts *SubszOptions) (*Subsz, error) {
 			return true
 		})
 
-		details := make([]SubDetail, len(subs))
+		details := make([]SubDetail, 0, len(subs))
 		i := 0
 		// TODO(dlc) - may be inefficient and could just do normal match when total subs is large and filtering.
 		for _, sub := range subs {
@@ -1027,7 +1040,7 @@ func (s *Server) Subsz(opts *SubszOptions) (*Subsz, error) {
 				continue
 			}
 			sub.client.mu.Lock()
-			details[i] = newSubDetail(sub)
+			details = append(details, newSubDetail(sub))
 			sub.client.mu.Unlock()
 			i++
 		}
@@ -1044,7 +1057,7 @@ func (s *Server) Subsz(opts *SubszOptions) (*Subsz, error) {
 			maxoff = maxIndex
 		}
 		sz.Subs = details[minoff:maxoff]
-		sz.Total = len(sz.Subs)
+		sz.Total = len(details)
 	} else {
 		s.accounts.Range(func(k, v any) bool {
 			acc := v.(*Account)
@@ -1097,12 +1110,7 @@ func (s *Server) HandleSubsz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var b []byte
-
-	if len(st.Subs) == 0 {
-		b, err = json.MarshalIndent(st.SublistStats, "", "  ")
-	} else {
-		b, err = json.MarshalIndent(st, "", "  ")
-	}
+	b, err = json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		s.Errorf("Error marshaling response to /subscriptionsz request: %v", err)
 	}
@@ -1239,6 +1247,7 @@ type Varz struct {
 	ConfigLoadTime        time.Time              `json:"config_load_time"`
 	ConfigDigest          string                 `json:"config_digest"`
 	Tags                  jwt.TagList            `json:"tags,omitempty"`
+	Metadata              map[string]string      `json:"metadata,omitempty"`
 	TrustedOperatorsJwt   []string               `json:"trusted_operators_jwt,omitempty"`
 	TrustedOperatorsClaim []*jwt.OperatorClaims  `json:"trusted_operators_claim,omitempty"`
 	SystemAccount         string                 `json:"system_account,omitempty"`
@@ -1609,7 +1618,6 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 		MaxSubs:               opts.MaxSubs,
 		Cores:                 runtime.NumCPU(),
 		MaxProcs:              runtime.GOMAXPROCS(0),
-		Tags:                  opts.Tags,
 		TrustedOperatorsJwt:   opts.operatorJWT,
 		TrustedOperatorsClaim: opts.TrustedOperators,
 	}
@@ -1696,6 +1704,8 @@ func (s *Server) updateVarzConfigReloadableFields(v *Varz) {
 	v.WriteDeadline = opts.WriteDeadline
 	v.ConfigLoadTime = s.configTime.UTC()
 	v.ConfigDigest = opts.configDigest
+	v.Tags = opts.Tags
+	v.Metadata = opts.Metadata
 	// Update route URLs if applicable
 	if s.varzUpdateRouteURLs {
 		v.Cluster.URLs = urlsToStrings(opts.Routes)
@@ -2365,7 +2375,7 @@ func (s *Server) AccountStatz(opts *AccountStatzOptions) (*AccountStatz, error) 
 		s.accounts.Range(func(key, a any) bool {
 			acc := a.(*Account)
 			acc.mu.RLock()
-			if opts.IncludeUnused || acc.numLocalConnections() != 0 {
+			if (opts != nil && opts.IncludeUnused) || acc.numLocalConnections() != 0 {
 				stz.Accounts = append(stz.Accounts, acc.statz())
 			}
 			acc.mu.RUnlock()
@@ -4024,8 +4034,8 @@ func (s *Server) Raftz(opts *RaftzOptions) *RaftzStatus {
 				Known:               p.kp,
 				LastReplicatedIndex: p.li,
 			}
-			if p.ts > 0 {
-				peer.LastSeen = time.Since(time.Unix(0, p.ts)).String()
+			if !p.ts.IsZero() {
+				peer.LastSeen = time.Since(p.ts).String()
 			}
 			info.Peers[id] = peer
 		}

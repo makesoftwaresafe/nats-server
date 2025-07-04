@@ -8384,6 +8384,50 @@ func TestJetStreamConsumerPullMaxWaitingOfOne(t *testing.T) {
 	}
 }
 
+func TestJetStreamConsumerPullMaxWaitingOfOneWithHeartbeatInterval(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"TEST.A"}})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:    "dur",
+		MaxWaiting: 1,
+		AckPolicy:  nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// First check that a request can timeout (we had an issue where this was
+	// not the case for MaxWaiting of 1).
+	req := JSApiConsumerGetNextRequest{Batch: 1, Expires: 250 * time.Millisecond}
+	reqb, _ := json.Marshal(req)
+	msg, err := nc.Request("$JS.API.CONSUMER.MSG.NEXT.TEST.dur", reqb, 13000*time.Millisecond)
+	require_NoError(t, err)
+	if v := msg.Header.Get("Status"); v != "408" {
+		t.Fatalf("Expected 408, got: %s", v)
+	}
+
+	// Now have a request waiting...
+	req = JSApiConsumerGetNextRequest{Batch: 1}
+	reqb, _ = json.Marshal(req)
+	// Send the request, but do not block since we want then to send an extra
+	// request that should be rejected.
+	sub := natsSubSync(t, nc, nats.NewInbox())
+	err = nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.dur", sub.Subject, reqb)
+	require_NoError(t, err)
+
+	// Send a new request, this should not respond since we specified an idle heartbeat,
+	// therefore the client will just expect to miss those instead.
+	req = JSApiConsumerGetNextRequest{Batch: 1, Expires: 500 * time.Millisecond, Heartbeat: 250 * time.Millisecond}
+	reqb, _ = json.Marshal(req)
+	_, err = nc.Request("$JS.API.CONSUMER.MSG.NEXT.TEST.dur", reqb, 300*time.Millisecond)
+	require_Error(t, err)
+}
+
 func TestJetStreamConsumerPullMaxWaiting(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -9641,4 +9685,47 @@ func TestJetStreamConsumerStateAlwaysFromStore(t *testing.T) {
 	require_NoError(t, err)
 	require_Equal(t, ci.Delivered.Stream, 1)
 	require_Equal(t, ci.AckFloor.Stream, 1)
+}
+
+func TestJetStreamConsumerPullNoWaitBatchLargerThanPending(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:       "C",
+		AckPolicy:     nats.AckExplicitPolicy,
+		FilterSubject: "foo",
+	})
+	require_NoError(t, err)
+
+	req := JSApiConsumerGetNextRequest{Batch: 10, NoWait: true}
+
+	for range 5 {
+		_, err := js.Publish("foo", []byte("OK"))
+		require_NoError(t, err)
+	}
+
+	sub := sendRequest(t, nc, "rply", req)
+	defer sub.Unsubscribe()
+
+	// Should get all 5 messages.
+	// TODO(mvv): Currently bypassing replicating first, need to figure out
+	//  how to send NoWait's request timeout after replication.
+	for range 5 {
+		msg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		if len(msg.Data) == 0 && msg.Header != nil {
+			t.Fatalf("Expected data, got: %s", msg.Header.Get("Description"))
+		}
+	}
 }
