@@ -77,6 +77,7 @@ type ClusterOpts struct {
 	Advertise         string            `json:"-"`
 	NoAdvertise       bool              `json:"-"`
 	ConnectRetries    int               `json:"-"`
+	ConnectBackoff    bool              `json:"-"`
 	PoolSize          int               `json:"-"`
 	PinnedAccounts    []string          `json:"-"`
 	Compression       CompressionOpts   `json:"-"`
@@ -121,6 +122,7 @@ type GatewayOpts struct {
 	TLSPinnedCerts    PinnedCertSet        `json:"-"`
 	Advertise         string               `json:"advertise,omitempty"`
 	ConnectRetries    int                  `json:"connect_retries,omitempty"`
+	ConnectBackoff    bool                 `json:"connect_backoff,omitempty"`
 	Gateways          []*RemoteGatewayOpts `json:"gateways,omitempty"`
 	RejectUnknown     bool                 `json:"reject_unknown,omitempty"` // config got renamed to reject_unknown_cluster
 
@@ -424,6 +426,9 @@ type Options struct {
 	// Tags describing the server. They will be included in varz
 	// and used as a filter criteria for some system requests.
 	Tags jwt.TagList `json:"-"`
+
+	// Metadata describing the server. They will be included in 'Z' responses.
+	Metadata map[string]string `json:"-"`
 
 	// OCSPConfig enables OCSP Stapling in the server.
 	OCSPConfig    *OCSPConfig
@@ -1648,6 +1653,24 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 			*errors = append(*errors, err)
 			return
 		}
+	case "server_metadata":
+		var err error
+		switch v := v.(type) {
+		case map[string]any:
+			for mk, mv := range v {
+				tk, mv = unwrapValue(mv, &lt)
+				if o.Metadata == nil {
+					o.Metadata = make(map[string]string)
+				}
+				o.Metadata[mk] = mv.(string)
+			}
+		default:
+			err = &configErr{tk, fmt.Sprintf("error parsing metadata: unsupported type %T", v)}
+		}
+		if err != nil {
+			*errors = append(*errors, err)
+			return
+		}
 	case "default_js_domain":
 		vv, ok := v.(map[string]any)
 		if !ok {
@@ -1882,6 +1905,8 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 			trackExplicitVal(&opts.inConfig, "Cluster.NoAdvertise", opts.Cluster.NoAdvertise)
 		case "connect_retries":
 			opts.Cluster.ConnectRetries = int(mv.(int64))
+		case "connect_backoff":
+			opts.Cluster.ConnectBackoff = mv.(bool)
 		case "permissions":
 			perms, err := parseUserPermissions(mv, errors)
 			if err != nil {
@@ -2090,6 +2115,8 @@ func parseGateway(v any, o *Options, errors *[]error, warnings *[]error) error {
 			o.Gateway.Advertise = mv.(string)
 		case "connect_retries":
 			o.Gateway.ConnectRetries = int(mv.(int64))
+		case "connect_backoff":
+			o.Gateway.ConnectBackoff = mv.(bool)
 		case "gateways":
 			gateways, err := parseGateways(mv, errors, warnings)
 			if err != nil {

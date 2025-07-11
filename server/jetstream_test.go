@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -2976,6 +2977,43 @@ func TestJetStreamRedeliveryAfterServerRestart(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamUsageNoReservation(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		var s *Server
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+		} else {
+			c := createJetStreamClusterExplicit(t, "R3S", replicas)
+			defer c.shutdown()
+			s = c.randomServer()
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{Name: "FILE", Storage: nats.FileStorage, Replicas: replicas})
+		require_NoError(t, err)
+		_, err = js.AddStream(&nats.StreamConfig{Name: "MEM", Storage: nats.MemoryStorage, Replicas: replicas})
+		require_NoError(t, err)
+
+		acc := s.globalAccount()
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			if streams := acc.numStreams(); streams != 2 {
+				return fmt.Errorf("not at 2 streams yet, got %d", streams)
+			}
+			return nil
+		})
+
+		stats := acc.JetStreamUsage()
+		require_Equal(t, stats.ReservedStore, 0)
+		require_Equal(t, stats.ReservedMemory, 0)
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
 }
 
 func TestJetStreamSnapshots(t *testing.T) {
@@ -9511,6 +9549,57 @@ func TestJetStreamMirrorBasics(t *testing.T) {
 
 }
 
+func TestJetStreamMirrorStripExpectedHeaders(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Create source and mirror streams.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "S",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:   "M",
+		Mirror: &nats.StreamSource{Name: "S"},
+	})
+	require_NoError(t, err)
+
+	m := nats.NewMsg("foo")
+	pubAck, err := js.PublishMsg(m)
+	require_NoError(t, err)
+	require_Equal(t, pubAck.Sequence, 1)
+
+	// Mirror should get message.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if si, err := js.StreamInfo("M"); err != nil {
+			return err
+		} else if si.State.Msgs != 1 {
+			return fmt.Errorf("expected 1 mirrored msg, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+
+	m.Header.Set("Nats-Expected-Stream", "S")
+	pubAck, err = js.PublishMsg(m)
+	require_NoError(t, err)
+	require_Equal(t, pubAck.Sequence, 2)
+
+	// Mirror should strip expected headers and store the message.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if si, err := js.StreamInfo("M"); err != nil {
+			return err
+		} else if si.State.Msgs != 2 {
+			return fmt.Errorf("expected 2 mirrored msgs, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+}
+
 func TestJetStreamMirrorUpdatePreventsSubjects(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -10358,6 +10447,86 @@ func TestJetStreamServerEncryption(t *testing.T) {
 
 			// Check that all is encrypted like above since we know we need to convert since snapshots always plaintext.
 			checkEncrypted()
+		})
+	}
+}
+
+func TestJetStreamServerEncryptionServerRestarts(t *testing.T) {
+	cases := []struct {
+		name   string
+		cstr   string
+		cipher StoreCipher
+	}{
+		{"Default", _EMPTY_, ChaCha},
+		{"ChaCha", ", cipher: chacha", ChaCha},
+		{"AES", ", cipher: aes", AES},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmpl := `
+				server_name: S22
+				listen: 127.0.0.1:-1
+				jetstream: {key: $JS_KEY, store_dir: '%s' %s}
+			`
+			storeDir := t.TempDir()
+
+			conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, storeDir, c.cstr)))
+
+			os.Setenv("JS_KEY", "s3cr3t!!")
+			defer os.Unsetenv("JS_KEY")
+
+			s, _ := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			config := s.JetStreamConfig()
+			if config == nil {
+				t.Fatalf("Expected config but got none")
+			}
+			defer removeDir(t, config.StoreDir)
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			// Add stream.
+			cfg := &nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo"},
+				Storage:  nats.FileStorage,
+			}
+			_, err := js.AddStream(cfg)
+			require_NoError(t, err)
+
+			// Restart to invalidate any in-memory state that adding the stream created.
+			s.Shutdown()
+			s, _ = RunServerWithConfig(conf)
+			defer s.Shutdown()
+			nc.Close()
+			nc, js = jsClientConnect(t, s)
+			defer nc.Close()
+
+			msg := []byte("ENCRYPTED PAYLOAD!!")
+			_, err = js.Publish("foo", msg)
+			require_NoError(t, err)
+
+			// Restart to invalidate any in-memory state that the publish initialized.
+			s.Shutdown()
+			s, _ = RunServerWithConfig(conf)
+			defer s.Shutdown()
+			nc.Close()
+			nc, js = jsClientConnect(t, s)
+			defer nc.Close()
+
+			// Should still be able to get the data.
+			sub, err := js.SubscribeSync("foo")
+			require_NoError(t, err)
+			defer sub.Drain()
+
+			m, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			meta, err := m.Metadata()
+			require_NoError(t, err)
+			require_Equal(t, meta.Sequence.Stream, 1)
 		})
 	}
 }
@@ -20111,5 +20280,961 @@ func TestJetStreamDirectGetStartTimeSingleMsg(t *testing.T) {
 			require_NoError(t, err)
 			require_Equal(t, msg.Header.Get("Status"), "404")
 		})
+	}
+}
+
+func TestJetStreamStreamRetentionUpdatesConsumers(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	for _, tc := range []struct {
+		from RetentionPolicy
+		to   RetentionPolicy
+	}{
+		{LimitsPolicy, InterestPolicy},
+		{InterestPolicy, LimitsPolicy},
+	} {
+		from, to, name := tc.from, tc.to, fmt.Sprintf("%sTo%s", tc.from, tc.to)
+		t.Run(name, func(t *testing.T) {
+			sc, err := jsStreamCreate(t, nc, &StreamConfig{
+				Name:      name,
+				Subjects:  []string{name},
+				Retention: from,
+				Storage:   FileStorage,
+			})
+			require_NoError(t, err)
+
+			_, err = js.AddConsumer(name, &nats.ConsumerConfig{
+				Name:      "test_consumer",
+				AckPolicy: nats.AckExplicitPolicy,
+			})
+			require_NoError(t, err)
+
+			mset, err := s.globalAccount().lookupStream(name)
+			require_NoError(t, err)
+
+			o := mset.lookupConsumer("test_consumer")
+			require_NotNil(t, err)
+			require_Equal(t, o.retention, from)
+
+			sc.Retention = to
+			_, err = jsStreamUpdate(t, nc, sc)
+			require_NoError(t, err)
+
+			require_Equal(t, o.retention, to)
+		})
+	}
+}
+
+func TestJetStreamMaxMsgsPerSubjectAndDeliverLastPerSubject(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	const subjects = 300
+	const msgs = subjects * 10
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:              "test",
+		Subjects:          []string{"foo.>", "bar.>"},
+		Retention:         nats.LimitsPolicy,
+		Storage:           nats.FileStorage,
+		MaxMsgsPerSubject: 5,
+	})
+	require_NoError(t, err)
+
+	// First, publish some messages that match the consumer filter. These
+	// are the messages that we expect to consume a subset of. The random
+	// sequences give us interior gaps after MaxMsgsPerSubject has been
+	// enforced which is needed for this test to work.
+	for range msgs {
+		subj := fmt.Sprintf("foo.%d", rand.Intn(subjects))
+		_, err = js.Publish(subj, nil)
+		require_NoError(t, err)
+	}
+
+	// Then publish some messages on a different subject. These won't be
+	// matched by the consumer filter.
+	for range msgs / 10 {
+		subj := fmt.Sprintf("bar.%d", rand.Intn(subjects/10))
+		_, err = js.Publish(subj, nil)
+		require_NoError(t, err)
+	}
+
+	// Add a deliver last per consumer that matches the first batch of
+	// published messages only. We expect at this point that the skiplist
+	// of the consumer will be for foo.> messages only, but the resume
+	// sequence will be the stream last sequence at the time, i.e. the
+	// last bar.> message.
+	_, err = js.AddConsumer("test", &nats.ConsumerConfig{
+		Name:           "test_consumer",
+		FilterSubjects: []string{"foo.>"},
+		DeliverPolicy:  nats.DeliverLastPerSubjectPolicy,
+		AckPolicy:      nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// Take a copy of the skiplist and the resume value so that we can
+	// make sure we receive all the messages we expect.
+	mset, err := s.globalAccount().lookupStream("test")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("test_consumer")
+	o.mu.RLock()
+	pending := make(map[uint64]struct{}, len(o.lss.seqs))
+	for _, seq := range o.lss.seqs {
+		pending[seq] = struct{}{}
+	}
+	resume := o.lss.resume
+	o.mu.RUnlock()
+
+	// Now fetch the messages from the consumer.
+	ps, err := js.PullSubscribe(_EMPTY_, _EMPTY_, nats.Bind("test", "test_consumer"))
+	require_NoError(t, err)
+	for range subjects {
+		msgs, err := ps.Fetch(1)
+		require_NoError(t, err)
+		for _, msg := range msgs {
+			meta, err := msg.Metadata()
+			require_NoError(t, err)
+			// We must be expecting this sequence and not have seen it already.
+			// Once we've seen it, take it out of the map.
+			_, ok := pending[meta.Sequence.Stream]
+			require_True(t, ok)
+			delete(pending, meta.Sequence.Stream)
+			// Then ack.
+			require_NoError(t, msg.AckSync())
+		}
+	}
+
+	// We should have received every message that was in the skiplist.
+	require_Len(t, len(pending), 0)
+
+	// When we've run out of last sequences per subject, the consumer
+	// should now continue from the resume seq, i.e. the last bar.> message.
+	o.mu.RLock()
+	sseq := o.sseq
+	o.mu.RUnlock()
+	require_Equal(t, sseq, resume+1)
+}
+
+func TestJetStreamAllowMsgCounter(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		var s *Server
+		var servers []*Server
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			servers = []*Server{s}
+			s.optsMu.Lock()
+			s.opts.MaxPayload = 1024
+			s.optsMu.Unlock()
+			defer s.Shutdown()
+		} else {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			servers = c.servers
+			for _, cs := range c.servers {
+				cs.optsMu.Lock()
+				cs.opts.MaxPayload = 1024
+				cs.optsMu.Unlock()
+			}
+			s = c.randomServer()
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		cfg := &StreamConfig{
+			Name:            "TEST",
+			Subjects:        []string{"foo"},
+			Storage:         FileStorage,
+			AllowMsgCounter: false,
+			Replicas:        replicas,
+		}
+
+		_, err := jsStreamCreate(t, nc, cfg)
+		require_NoError(t, err)
+
+		// A normal publish will succeed, as it's not a counter.
+		m := nats.NewMsg("foo")
+		m.Header.Set("Key", "Value")
+		pa, err := js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pa.Sequence, 1)
+
+		// Stream with disabled counters doesn't allow to publish counters.
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "1")
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSMessageIncrDisabledError())
+
+		// Enabling counters is not allowed.
+		cfg.AllowMsgCounter = true
+		_, err = jsStreamUpdate(t, nc, cfg)
+		require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change message counter setting")))
+
+		// Recreate stream with counters enabled.
+		require_NoError(t, js.DeleteStream("TEST"))
+		_, err = jsStreamCreate(t, nc, cfg)
+		require_NoError(t, err)
+
+		// Don't allow if missing counter increment.
+		m = nats.NewMsg("foo")
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSMessageIncrMissingError())
+
+		m.Header.Set("Key", "Value")
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSMessageIncrMissingError())
+
+		// Don't allow if increment contains payload.
+		m.Header.Set("Nats-Incr", "1")
+		m.Data = []byte("data")
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSMessageIncrPayloadError())
+
+		// Don't allow if counter increment is invalid.
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "bogus")
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSMessageIncrInvalidError())
+
+		validateTotal := func(seq uint64, total *big.Int) {
+			t.Helper()
+			rsm, err := js.GetLastMsg("TEST", "foo")
+			require_NoError(t, err)
+			require_Equal(t, rsm.Sequence, seq)
+
+			var val CounterValue
+			require_NoError(t, json.Unmarshal(rsm.Data, &val))
+			var res big.Int
+			res.SetString(val.Value, 10)
+			require_Equal(t, res.Int64(), total.Int64())
+		}
+
+		increment := func(incr string, seq uint64, total *big.Int) {
+			t.Helper()
+			m = nats.NewMsg("foo")
+			m.Header.Set("Nats-Incr", incr)
+
+			msg, err := nc.RequestMsg(m, time.Second)
+			require_NoError(t, err)
+			var pubAck PubAck
+			require_NoError(t, json.Unmarshal(msg.Data, &pubAck))
+			require_Equal(t, pubAck.Sequence, seq)
+			require_Equal(t, pubAck.Value, total.String())
+			validateTotal(seq, total)
+		}
+
+		// Perform and check increments.
+		increment("1", 1, big.NewInt(1))
+		increment("2", 2, big.NewInt(3))
+
+		// Can also decrement/reset the counter.
+		increment("-3", 3, big.NewInt(0))
+		increment("1", 4, big.NewInt(1))
+
+		// Check payload exceeded, positive bound.
+		tooLargeIncrement := strings.Repeat("1", 500)
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", tooLargeIncrement)
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSStreamMessageExceedsMaximumError())
+		validateTotal(4, big.NewInt(1))
+
+		// Check payload exceeded, negative bound.
+		increment("-2", 5, big.NewInt(-1))
+		m.Header.Set("Nats-Incr", fmt.Sprintf("-%s", tooLargeIncrement))
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSStreamMessageExceedsMaximumError())
+		validateTotal(5, big.NewInt(-1))
+
+		// Check de-duplication.
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "1")
+		m.Header.Set("Nats-Msg-Id", "dedupe")
+		msg, err := nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		var pubAck1 PubAck
+		require_NoError(t, json.Unmarshal(msg.Data, &pubAck1))
+		require_False(t, pubAck1.Duplicate)
+		require_Equal(t, pubAck1.Sequence, 6)
+		require_Equal(t, pubAck1.Value, "0")
+		validateTotal(6, big.NewInt(0))
+
+		// Re-send should not up counter, but also not return current value.
+		// When clustered this state can't be guaranteed.
+		msg, err = nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		var pubAck2 PubAck
+		require_NoError(t, json.Unmarshal(msg.Data, &pubAck2))
+		require_True(t, pubAck2.Duplicate)
+		require_Equal(t, pubAck2.Sequence, 6)
+		require_Equal(t, pubAck2.Value, _EMPTY_)
+		validateTotal(6, big.NewInt(0))
+
+		// Check rejected headers.
+		for _, header := range []string{JSMsgRollup, JSExpectedLastSeq, JSExpectedLastSubjSeq, JSExpectedLastSubjSeqSubj, JSExpectedLastMsgId} {
+			m = nats.NewMsg("foo")
+			m.Header.Set("Nats-Incr", "1")
+			m.Header.Set(header, "1")
+			_, err = js.PublishMsg(m)
+			require_Error(t, err, NewJSMessageIncrInvalidError())
+		}
+
+		// Manually break a counter in storage.
+		for _, cs := range servers {
+			mset, err := cs.globalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			seq, _, err := mset.Store().StoreMsg("foo", nil, nil, 0)
+			require_NoError(t, err)
+			require_Equal(t, seq, 7)
+		}
+
+		// Should now error, because counter is broken.
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "1")
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSMessageCounterBrokenError())
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamAllowMsgCounterIncompatibleSettings(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// DiscardNew not allowed.
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:            "TEST",
+		Subjects:        []string{"foo"},
+		Storage:         FileStorage,
+		AllowMsgCounter: true,
+		Discard:         DiscardNew,
+	})
+	require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("counter stream cannot use discard new")))
+
+	// AllowMsgTTL not allowed.
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name:            "TEST",
+		Subjects:        []string{"foo"},
+		Storage:         FileStorage,
+		AllowMsgCounter: true,
+		AllowMsgTTL:     true,
+	})
+	require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("counter stream cannot use message TTLs")))
+
+	// Only limits retention is allowed.
+	for _, retention := range []RetentionPolicy{InterestPolicy, WorkQueuePolicy} {
+		_, err = jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "TEST",
+			Subjects:        []string{"foo"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Retention:       retention,
+		})
+		require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("counter stream can only use limits retention")))
+	}
+}
+
+func TestJetStreamAllowMsgCounterMirror(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		var s *Server
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+		} else {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			s = c.randomServer()
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "O",
+			Subjects:        []string{"foo"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		})
+		require_NoError(t, err)
+
+		// Mirror with counters enabled is rejected.
+		mirrorCfg := &StreamConfig{
+			Name:            "M",
+			Mirror:          &StreamSource{Name: "O"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		}
+		_, err = jsStreamCreate(t, nc, mirrorCfg)
+		require_Error(t, err, NewJSMirrorWithCountersError())
+
+		// Mirror with verbatim copying of counters.
+		mirrorCfg.AllowMsgCounter = false
+		_, err = jsStreamCreate(t, nc, mirrorCfg)
+		require_NoError(t, err)
+
+		// A normal publish will succeed, as it's not a counter.
+		m := nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "1")
+		pubAck, err := js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, 1)
+
+		// Mirror should get message verbatim.
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			rsm, err := js.GetMsg("M", 1)
+			if err != nil {
+				return err
+			}
+			if incr := rsm.Header.Get("Nats-Incr"); incr != "1" {
+				return fmt.Errorf("incorrect increment: %q", incr)
+			}
+			var count CounterValue
+			if err := json.Unmarshal(rsm.Data, &count); err != nil {
+				return fmt.Errorf("JSON error: %w", err)
+			} else if count.Value != "1" {
+				return fmt.Errorf("unexpected value: %s", rsm.Data)
+			}
+			return nil
+		})
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamAllowMsgCounterSourceAggregates(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		var s *Server
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+		} else {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			s = c.randomServer()
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "O1",
+			Subjects:        []string{"foo.1"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		})
+		require_NoError(t, err)
+
+		_, err = jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "O2",
+			Subjects:        []string{"foo.2"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		})
+		require_NoError(t, err)
+
+		// Source will only work if counters are enabled on both streams.
+		sourceCfg := &StreamConfig{
+			Name: "M",
+			Sources: []*StreamSource{
+				{
+					Name:              "O1",
+					SubjectTransforms: []SubjectTransformConfig{{Source: "foo.1", Destination: "foo"}},
+				},
+				{
+					Name:              "O2",
+					SubjectTransforms: []SubjectTransformConfig{{Source: "foo.2", Destination: "foo"}},
+				},
+			},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		}
+		_, err = jsStreamCreate(t, nc, sourceCfg)
+		require_NoError(t, err)
+
+		m := nats.NewMsg("foo.1")
+		m.Header.Set("Nats-Incr", "1")
+		pubAck, err := js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, 1)
+
+		m = nats.NewMsg("foo.2")
+		m.Header.Set("Nats-Incr", "2")
+		pubAck, err = js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, 1)
+
+		// Source should aggregate.
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			rsm, err := js.GetMsg("M", 2)
+			if err != nil {
+				return err
+			}
+			var count CounterValue
+			if err := json.Unmarshal(rsm.Data, &count); err != nil {
+				return fmt.Errorf("JSON error: %w", err)
+			} else if count.Value != "3" {
+				return fmt.Errorf("unexpected value: %s", rsm.Data)
+			}
+			return nil
+		})
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamAllowMsgCounterSourceVerbatim(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		var s *Server
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+		} else {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			s = c.randomServer()
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "O1",
+			Subjects:        []string{"foo.1"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		})
+		require_NoError(t, err)
+
+		_, err = jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "O2",
+			Subjects:        []string{"foo.2"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		})
+		require_NoError(t, err)
+
+		// Source will only work if counters are enabled on both streams.
+		sourceCfg := &StreamConfig{
+			Name: "M",
+			Sources: []*StreamSource{
+				{
+					Name:              "O1",
+					SubjectTransforms: []SubjectTransformConfig{{Source: "foo.1", Destination: "foo"}},
+				},
+				{
+					Name:              "O2",
+					SubjectTransforms: []SubjectTransformConfig{{Source: "foo.2", Destination: "foo"}},
+				},
+			},
+			Storage:         FileStorage,
+			AllowMsgCounter: false,
+			Replicas:        replicas,
+		}
+		_, err = jsStreamCreate(t, nc, sourceCfg)
+		require_NoError(t, err)
+
+		m := nats.NewMsg("foo.1")
+		m.Header.Set("Nats-Incr", "1")
+		pubAck, err := js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, 1)
+
+		// Source should store verbatim.
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			rsm, err := js.GetMsg("M", 1)
+			if err != nil {
+				return err
+			}
+			var count CounterValue
+			if err := json.Unmarshal(rsm.Data, &count); err != nil {
+				return fmt.Errorf("JSON error: %w", err)
+			} else if count.Value != "1" {
+				return fmt.Errorf("unexpected value: %s", rsm.Data)
+			}
+			return nil
+		})
+
+		m = nats.NewMsg("foo.2")
+		m.Header.Set("Nats-Incr", "2")
+		pubAck, err = js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, 1)
+
+		// Source should store verbatim.
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			rsm, err := js.GetMsg("M", 2)
+			if err != nil {
+				return err
+			}
+			var count CounterValue
+			if err := json.Unmarshal(rsm.Data, &count); err != nil {
+				return fmt.Errorf("JSON error: %w", err)
+			} else if count.Value != "2" {
+				return fmt.Errorf("unexpected value: %s", rsm.Data)
+			}
+			return nil
+		})
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamAllowMsgCounterSourceStartingAboveZero(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		var s *Server
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+		} else {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			s = c.randomServer()
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "O1",
+			Subjects:        []string{"foo.1"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+			MaxMsgsPer:      1,
+		})
+		require_NoError(t, err)
+
+		_, err = jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "O2",
+			Subjects:        []string{"foo.2"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+			MaxMsgsPer:      1,
+		})
+		require_NoError(t, err)
+
+		for i := range uint64(5) {
+			m := nats.NewMsg("foo.1")
+			m.Header.Set("Nats-Incr", "1")
+			pubAck, err := js.PublishMsg(m)
+			require_NoError(t, err)
+			require_Equal(t, pubAck.Sequence, i+1)
+
+			m = nats.NewMsg("foo.2")
+			m.Header.Set("Nats-Incr", "2")
+			pubAck, err = js.PublishMsg(m)
+			require_NoError(t, err)
+			require_Equal(t, pubAck.Sequence, i+1)
+		}
+
+		// Source will only work if counters are enabled on both streams.
+		_, err = jsStreamCreate(t, nc, &StreamConfig{
+			Name:            "M",
+			Subjects:        []string{"foo"},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		})
+		require_NoError(t, err)
+
+		// Now make an addition locally on this stream too.
+		m := nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "1")
+		pubAck, err := js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, 1)
+
+		// Source will only work if counters are enabled on both streams.
+		_, err = jsStreamUpdate(t, nc, &StreamConfig{
+			Name:     "M",
+			Subjects: []string{"foo"},
+			Sources: []*StreamSource{
+				{
+					Name:              "O1",
+					SubjectTransforms: []SubjectTransformConfig{{Source: "foo.1", Destination: "foo"}},
+				},
+				{
+					Name:              "O2",
+					SubjectTransforms: []SubjectTransformConfig{{Source: "foo.2", Destination: "foo"}},
+				},
+			},
+			Storage:         FileStorage,
+			AllowMsgCounter: true,
+			Replicas:        replicas,
+		})
+		require_NoError(t, err)
+
+		// Source should aggregate.
+		var first, second, third, fourth *nats.RawStreamMsg
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			first, err = js.GetMsg("M", 1)
+			if err != nil {
+				return err
+			}
+			second, err = js.GetMsg("M", 2)
+			if err != nil {
+				return err
+			}
+			third, err = js.GetMsg("M", 3)
+			return err
+		})
+
+		// Now make an addition locally on this stream too.
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "1")
+		pubAck, err = js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, 4)
+
+		// Fetch it back out of the stream.
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			fourth, err = js.GetMsg("M", 4)
+			return err
+		})
+
+		// There are no local additions to this counter, but the total
+		// comprises changes from the sources.
+		var count CounterValue
+		require_NoError(t, json.Unmarshal(fourth.Data, &count))
+		require_Equal(t, count.Value, "17")
+
+		// The most recent message should contain information about both
+		// sources, so let's check.
+		var sources CounterSources
+		require_NoError(t, json.Unmarshal([]byte(fourth.Header.Get(JSMessageCounterSources)), &sources))
+		require_NotNil(t, sources["O1"])
+		require_NotNil(t, sources["O2"])
+		require_Equal(t, sources["O1"]["foo.1"], "5")
+		require_Equal(t, sources["O2"]["foo.2"], "10")
+
+		// Since this is the first time we've seen a message from these
+		// sources, the Nats-Incr header should have been updated to reflect
+		// the correct delta.
+		for _, rsm := range []*nats.RawStreamMsg{first, second, third, fourth} {
+			require_Equal(t, rsm.Subject, "foo") // Subject transform'd
+			switch rsm {
+			case first:
+				require_Equal(t, rsm.Header.Get(JSMessageIncr), "1")
+			case second, third: // We can't know which order they got sourced in
+				incr := rsm.Header.Get(JSMessageIncr)
+				require_True(t, incr == "5" || incr == "10")
+			case fourth:
+				require_Equal(t, rsm.Header.Get(JSMessageIncr), "1")
+			}
+		}
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamAtomicBatchPublish(t *testing.T) {
+	test := func(
+		t *testing.T,
+		nc *nats.Conn,
+		js nats.JetStreamContext,
+		storage StorageType,
+		retention RetentionPolicy,
+		replicas int,
+	) {
+		var pubAck JSPubAckResponse
+
+		cfg := &StreamConfig{
+			Name:      "TEST",
+			Subjects:  []string{"foo.*"},
+			Storage:   storage,
+			Retention: retention,
+			Replicas:  replicas,
+		}
+
+		_, err := jsStreamCreate(t, nc, cfg)
+		require_NoError(t, err)
+
+		m := nats.NewMsg("foo.0")
+		m.Data = []byte("foo.0")
+		m.Header.Set("Nats-Batch-Id", "uuid")
+
+		// Publish with atomic publish disabled.
+		rmsg, err := nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_NotNil(t, pubAck.Error)
+		require_Error(t, pubAck.Error, NewJSAtomicPublishDisabledError())
+
+		// Enable atomic publish.
+		cfg.AllowAtomicPublish = true
+		_, err = jsStreamUpdate(t, nc, cfg)
+		require_NoError(t, err)
+
+		// Publish without batch sequence errors.
+		rmsg, err = nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		pubAck = JSPubAckResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_Error(t, pubAck.Error, NewJSAtomicPublishMissingSeqError())
+
+		// Publish a batch, misses start.
+		m.Header.Set("Nats-Batch-Id", "uuid")
+		m.Header.Set("Nats-Batch-Sequence", "2")
+		rmsg, err = nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		pubAck = JSPubAckResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_Error(t, pubAck.Error, NewJSAtomicPublishIncompleteBatchError())
+
+		// Publish a "batch" which immediately commits.
+		m.Header.Set("Nats-Batch-Id", "uuid")
+		m.Header.Set("Nats-Batch-Sequence", "1")
+		m.Header.Set("Nats-Batch-Commit", "1")
+		rmsg, err = nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		pubAck = JSPubAckResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_Equal(t, pubAck.Sequence, 1)
+		require_Equal(t, pubAck.BatchId, "uuid")
+		require_Equal(t, pubAck.BatchSize, 1)
+
+		// Reset commit.
+		m.Header.Del("Nats-Batch-Commit")
+
+		// Publish a "batch" which has gaps.
+		require_NoError(t, nc.PublishMsg(m))
+		m.Header.Set("Nats-Batch-Sequence", "3")
+		rmsg, err = nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		pubAck = JSPubAckResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_Error(t, pubAck.Error, NewJSAtomicPublishIncompleteBatchError())
+
+		// Publish a batch of N messages.
+		m.Header.Del("Nats-Batch-Commit")
+		for seq, batch := uint64(1), uint64(5); seq <= batch; seq++ {
+			m.Subject = fmt.Sprintf("foo.%d", seq)
+			m.Data = []byte(m.Subject)
+			m.Header.Set("Nats-Batch-Sequence", strconv.FormatUint(seq, 10))
+			// If not commit.
+			if seq != batch {
+				require_NoError(t, nc.PublishMsg(m))
+				continue
+			}
+
+			m.Header.Set("Nats-Batch-Commit", "1")
+			rmsg, err = nc.RequestMsg(m, time.Second)
+			require_NoError(t, err)
+
+			pubAck = JSPubAckResponse{}
+			require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+			require_Equal(t, pubAck.Sequence, 6)
+			require_Equal(t, pubAck.BatchId, "uuid")
+			require_Equal(t, pubAck.BatchSize, 5)
+		}
+
+		// Validate stream contents.
+		if retention != InterestPolicy {
+			for i := 0; i < 6; i++ {
+				rsm, err := js.GetMsg("TEST", uint64(i+1))
+				require_NoError(t, err)
+				subj := fmt.Sprintf("foo.%d", i)
+				require_Equal(t, rsm.Subject, subj)
+				require_Equal(t, string(rsm.Data), subj)
+			}
+		}
+
+		// TODO(mvv): implement timeout
+	}
+
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		for _, retention := range []RetentionPolicy{LimitsPolicy, InterestPolicy, WorkQueuePolicy} {
+			replicas := 3
+			t.Run(fmt.Sprintf("%s/%s/R%d", storage, retention, replicas), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+
+				test(t, nc, js, storage, retention, replicas)
+			})
+		}
+	}
+}
+
+func TestJetStreamAtomicBatchPublishDedupeNotAllowed(t *testing.T) {
+	test := func(
+		t *testing.T,
+		nc *nats.Conn,
+		js nats.JetStreamContext,
+		storage StorageType,
+		retention RetentionPolicy,
+		replicas int,
+	) {
+		cfg := &StreamConfig{
+			Name:               "TEST",
+			Retention:          retention,
+			Subjects:           []string{"foo"},
+			Replicas:           3,
+			Storage:            FileStorage,
+			AllowAtomicPublish: true,
+		}
+
+		_, err := jsStreamCreate(t, nc, cfg)
+		require_NoError(t, err)
+
+		m := nats.NewMsg("foo")
+		m.Header.Set("Nats-Batch-Id", "uuid")
+		m.Header.Set("Nats-Batch-Sequence", "1")
+		m.Header.Set("Nats-Msg-Id", "msgId1")
+		require_NoError(t, nc.PublishMsg(m))
+		m.Header.Set("Nats-Batch-Sequence", "2")
+		m.Header.Set("Nats-Msg-Id", "pre-existing")
+		require_NoError(t, nc.PublishMsg(m))
+
+		var pubAck JSPubAckResponse
+		m.Header.Set("Nats-Batch-Sequence", "3")
+		m.Header.Set("Nats-Msg-Id", "msgId2")
+		m.Header.Set("Nats-Batch-Commit", "1")
+		rmsg, err := nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_NotNil(t, pubAck.Error)
+		require_Error(t, pubAck.Error, NewJSAtomicPublishDuplicateError())
+	}
+
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		for _, retention := range []RetentionPolicy{LimitsPolicy, InterestPolicy, WorkQueuePolicy} {
+			replicas := 3
+			t.Run(fmt.Sprintf("%s/%s/R%d", storage, retention, replicas), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+
+				test(t, nc, js, storage, retention, replicas)
+			})
+		}
 	}
 }

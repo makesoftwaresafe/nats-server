@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats-server/v2/server/gsl"
 	"github.com/nats-io/nuid"
 )
 
@@ -1107,11 +1108,11 @@ func TestMemStoreNumPendingMulti(t *testing.T) {
 	}
 
 	// Now we want to do a calculate NumPendingMulti.
-	filters := NewSublistNoCache()
+	filters := gsl.NewSublist[struct{}]()
 	for filters.Count() < uint32(numFiltered) {
 		filter := subjects[rand.Intn(totalSubjects)]
 		if !filters.HasInterest(filter) {
-			filters.Insert(&subscription{subject: []byte(filter)})
+			filters.Insert(filter, struct{}{})
 		}
 	}
 
@@ -1310,6 +1311,30 @@ func TestMemStoreUpdateConfigTTLState(t *testing.T) {
 	cfg.AllowMsgTTL = false
 	require_NoError(t, ms.UpdateConfig(cfg))
 	require_Equal(t, ms.ttls, nil)
+}
+
+func TestMemStoreSubjectForSeq(t *testing.T) {
+	cfg := StreamConfig{
+		Name:     "foo",
+		Subjects: []string{"foo.>"},
+		Storage:  MemoryStorage,
+	}
+	ms, err := newMemStore(&cfg)
+	require_NoError(t, err)
+
+	seq, _, err := ms.StoreMsg("foo.bar", nil, nil, 0)
+	require_NoError(t, err)
+	require_Equal(t, seq, 1)
+
+	_, err = ms.SubjectForSeq(0)
+	require_Error(t, err, ErrStoreMsgNotFound)
+
+	subj, err := ms.SubjectForSeq(1)
+	require_NoError(t, err)
+	require_Equal(t, subj, "foo.bar")
+
+	_, err = ms.SubjectForSeq(2)
+	require_Error(t, err, ErrStoreMsgNotFound)
 }
 
 ///////////////////////////////////////////////////////////////////////////

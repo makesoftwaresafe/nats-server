@@ -8,6 +8,18 @@ const (
 	// JSAccountResourcesExceededErr resource limits exceeded for account
 	JSAccountResourcesExceededErr ErrorIdentifier = 10002
 
+	// JSAtomicPublishDisabledErr atomic publish is disabled
+	JSAtomicPublishDisabledErr ErrorIdentifier = 10174
+
+	// JSAtomicPublishDuplicateErr atomic publish duplicates not allowed
+	JSAtomicPublishDuplicateErr ErrorIdentifier = 10177
+
+	// JSAtomicPublishIncompleteBatchErr atomic publish batch is incomplete
+	JSAtomicPublishIncompleteBatchErr ErrorIdentifier = 10176
+
+	// JSAtomicPublishMissingSeqErr atomic publish sequence is missing
+	JSAtomicPublishMissingSeqErr ErrorIdentifier = 10175
+
 	// JSBadRequestErr bad request
 	JSBadRequestErr ErrorIdentifier = 10003
 
@@ -197,6 +209,9 @@ const (
 	// JSConsumerPushMaxWaitingErr consumer in push mode can not set max waiting
 	JSConsumerPushMaxWaitingErr ErrorIdentifier = 10080
 
+	// JSConsumerPushWithPriorityGroupErr priority groups can not be used with push consumers
+	JSConsumerPushWithPriorityGroupErr ErrorIdentifier = 10178
+
 	// JSConsumerReplacementWithDifferentNameErr consumer replacement durable config not the same
 	JSConsumerReplacementWithDifferentNameErr ErrorIdentifier = 10106
 
@@ -242,6 +257,21 @@ const (
 	// JSMemoryResourcesExceededErr insufficient memory resources available
 	JSMemoryResourcesExceededErr ErrorIdentifier = 10028
 
+	// JSMessageCounterBrokenErr message counter is broken
+	JSMessageCounterBrokenErr ErrorIdentifier = 10172
+
+	// JSMessageIncrDisabledErr message counters is disabled
+	JSMessageIncrDisabledErr ErrorIdentifier = 10168
+
+	// JSMessageIncrInvalidErr message counter increment is invalid
+	JSMessageIncrInvalidErr ErrorIdentifier = 10171
+
+	// JSMessageIncrMissingErr message counter increment is missing
+	JSMessageIncrMissingErr ErrorIdentifier = 10169
+
+	// JSMessageIncrPayloadErr message counter has payload
+	JSMessageIncrPayloadErr ErrorIdentifier = 10170
+
 	// JSMessageTTLDisabledErr per-message TTL is disabled
 	JSMessageTTLDisabledErr ErrorIdentifier = 10166
 
@@ -268,6 +298,9 @@ const (
 
 	// JSMirrorOverlappingSubjectFilters mirror subject filters can not overlap
 	JSMirrorOverlappingSubjectFilters ErrorIdentifier = 10152
+
+	// JSMirrorWithCountersErr stream mirrors can not also calculate counters
+	JSMirrorWithCountersErr ErrorIdentifier = 10173
 
 	// JSMirrorWithFirstSeqErr stream mirrors can not have first sequence configured
 	JSMirrorWithFirstSeqErr ErrorIdentifier = 10143
@@ -507,6 +540,10 @@ const (
 var (
 	ApiErrors = map[ErrorIdentifier]*ApiError{
 		JSAccountResourcesExceededErr:              {Code: 400, ErrCode: 10002, Description: "resource limits exceeded for account"},
+		JSAtomicPublishDisabledErr:                 {Code: 400, ErrCode: 10174, Description: "atomic publish is disabled"},
+		JSAtomicPublishDuplicateErr:                {Code: 400, ErrCode: 10177, Description: "atomic publish duplicates not allowed"},
+		JSAtomicPublishIncompleteBatchErr:          {Code: 400, ErrCode: 10176, Description: "atomic publish batch is incomplete"},
+		JSAtomicPublishMissingSeqErr:               {Code: 400, ErrCode: 10175, Description: "atomic publish sequence is missing"},
 		JSBadRequestErr:                            {Code: 400, ErrCode: 10003, Description: "bad request"},
 		JSClusterIncompleteErr:                     {Code: 503, ErrCode: 10004, Description: "incomplete results"},
 		JSClusterNoPeersErrF:                       {Code: 400, ErrCode: 10005, Description: "{err}"},
@@ -570,6 +607,7 @@ var (
 		JSConsumerPullRequiresAckErr:               {Code: 400, ErrCode: 10084, Description: "consumer in pull mode requires explicit ack policy on workqueue stream"},
 		JSConsumerPullWithRateLimitErr:             {Code: 400, ErrCode: 10086, Description: "consumer in pull mode can not have rate limit set"},
 		JSConsumerPushMaxWaitingErr:                {Code: 400, ErrCode: 10080, Description: "consumer in push mode can not set max waiting"},
+		JSConsumerPushWithPriorityGroupErr:         {Code: 400, ErrCode: 10178, Description: "priority groups can not be used with push consumers"},
 		JSConsumerReplacementWithDifferentNameErr:  {Code: 400, ErrCode: 10106, Description: "consumer replacement durable config not the same"},
 		JSConsumerReplicasExceedsStream:            {Code: 400, ErrCode: 10126, Description: "consumer config replica count exceeds parent stream"},
 		JSConsumerReplicasShouldMatchStream:        {Code: 400, ErrCode: 10134, Description: "consumer config replicas must match interest retention stream's replicas"},
@@ -585,6 +623,11 @@ var (
 		JSMaximumConsumersLimitErr:                 {Code: 400, ErrCode: 10026, Description: "maximum consumers limit reached"},
 		JSMaximumStreamsLimitErr:                   {Code: 400, ErrCode: 10027, Description: "maximum number of streams reached"},
 		JSMemoryResourcesExceededErr:               {Code: 500, ErrCode: 10028, Description: "insufficient memory resources available"},
+		JSMessageCounterBrokenErr:                  {Code: 400, ErrCode: 10172, Description: "message counter is broken"},
+		JSMessageIncrDisabledErr:                   {Code: 400, ErrCode: 10168, Description: "message counters is disabled"},
+		JSMessageIncrInvalidErr:                    {Code: 400, ErrCode: 10171, Description: "message counter increment is invalid"},
+		JSMessageIncrMissingErr:                    {Code: 400, ErrCode: 10169, Description: "message counter increment is missing"},
+		JSMessageIncrPayloadErr:                    {Code: 400, ErrCode: 10170, Description: "message counter has payload"},
 		JSMessageTTLDisabledErr:                    {Code: 400, ErrCode: 10166, Description: "per-message TTL is disabled"},
 		JSMessageTTLInvalidErr:                     {Code: 400, ErrCode: 10165, Description: "invalid per-message TTL"},
 		JSMirrorConsumerSetupFailedErrF:            {Code: 500, ErrCode: 10029, Description: "{err}"},
@@ -594,6 +637,7 @@ var (
 		JSMirrorMaxMessageSizeTooBigErr:            {Code: 400, ErrCode: 10030, Description: "stream mirror must have max message size >= source"},
 		JSMirrorMultipleFiltersNotAllowed:          {Code: 400, ErrCode: 10150, Description: "mirror with multiple subject transforms cannot also have a single subject filter"},
 		JSMirrorOverlappingSubjectFilters:          {Code: 400, ErrCode: 10152, Description: "mirror subject filters can not overlap"},
+		JSMirrorWithCountersErr:                    {Code: 400, ErrCode: 10173, Description: "stream mirrors can not also calculate counters"},
 		JSMirrorWithFirstSeqErr:                    {Code: 400, ErrCode: 10143, Description: "stream mirrors can not have first sequence configured"},
 		JSMirrorWithSourcesErr:                     {Code: 400, ErrCode: 10031, Description: "stream mirrors can not also contain other sources"},
 		JSMirrorWithStartSeqAndTimeErr:             {Code: 400, ErrCode: 10032, Description: "stream mirrors can not have both start seq and start time configured"},
@@ -705,6 +749,46 @@ func NewJSAccountResourcesExceededError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSAccountResourcesExceededErr]
+}
+
+// NewJSAtomicPublishDisabledError creates a new JSAtomicPublishDisabledErr error: "atomic publish is disabled"
+func NewJSAtomicPublishDisabledError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSAtomicPublishDisabledErr]
+}
+
+// NewJSAtomicPublishDuplicateError creates a new JSAtomicPublishDuplicateErr error: "atomic publish duplicates not allowed"
+func NewJSAtomicPublishDuplicateError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSAtomicPublishDuplicateErr]
+}
+
+// NewJSAtomicPublishIncompleteBatchError creates a new JSAtomicPublishIncompleteBatchErr error: "atomic publish batch is incomplete"
+func NewJSAtomicPublishIncompleteBatchError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSAtomicPublishIncompleteBatchErr]
+}
+
+// NewJSAtomicPublishMissingSeqError creates a new JSAtomicPublishMissingSeqErr error: "atomic publish sequence is missing"
+func NewJSAtomicPublishMissingSeqError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSAtomicPublishMissingSeqErr]
 }
 
 // NewJSBadRequestError creates a new JSBadRequestErr error: "bad request"
@@ -1397,6 +1481,16 @@ func NewJSConsumerPushMaxWaitingError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSConsumerPushMaxWaitingErr]
 }
 
+// NewJSConsumerPushWithPriorityGroupError creates a new JSConsumerPushWithPriorityGroupErr error: "priority groups can not be used with push consumers"
+func NewJSConsumerPushWithPriorityGroupError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerPushWithPriorityGroupErr]
+}
+
 // NewJSConsumerReplacementWithDifferentNameError creates a new JSConsumerReplacementWithDifferentNameErr error: "consumer replacement durable config not the same"
 func NewJSConsumerReplacementWithDifferentNameError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1559,6 +1653,56 @@ func NewJSMemoryResourcesExceededError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSMemoryResourcesExceededErr]
 }
 
+// NewJSMessageCounterBrokenError creates a new JSMessageCounterBrokenErr error: "message counter is broken"
+func NewJSMessageCounterBrokenError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageCounterBrokenErr]
+}
+
+// NewJSMessageIncrDisabledError creates a new JSMessageIncrDisabledErr error: "message counters is disabled"
+func NewJSMessageIncrDisabledError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageIncrDisabledErr]
+}
+
+// NewJSMessageIncrInvalidError creates a new JSMessageIncrInvalidErr error: "message counter increment is invalid"
+func NewJSMessageIncrInvalidError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageIncrInvalidErr]
+}
+
+// NewJSMessageIncrMissingError creates a new JSMessageIncrMissingErr error: "message counter increment is missing"
+func NewJSMessageIncrMissingError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageIncrMissingErr]
+}
+
+// NewJSMessageIncrPayloadError creates a new JSMessageIncrPayloadErr error: "message counter has payload"
+func NewJSMessageIncrPayloadError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageIncrPayloadErr]
+}
+
 // NewJSMessageTTLDisabledError creates a new JSMessageTTLDisabledErr error: "per-message TTL is disabled"
 func NewJSMessageTTLDisabledError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1665,6 +1809,16 @@ func NewJSMirrorOverlappingSubjectFiltersError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSMirrorOverlappingSubjectFilters]
+}
+
+// NewJSMirrorWithCountersError creates a new JSMirrorWithCountersErr error: "stream mirrors can not also calculate counters"
+func NewJSMirrorWithCountersError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorWithCountersErr]
 }
 
 // NewJSMirrorWithFirstSeqError creates a new JSMirrorWithFirstSeqErr error: "stream mirrors can not have first sequence configured"

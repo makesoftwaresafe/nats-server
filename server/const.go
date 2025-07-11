@@ -1,4 +1,4 @@
-// Copyright 2012-2024 The NATS Authors
+// Copyright 2012-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -138,7 +138,10 @@ const (
 	// DEFAULT_ROUTE_CONNECT Route solicitation intervals.
 	DEFAULT_ROUTE_CONNECT = 1 * time.Second
 
-	// DEFAULT_ROUTE_RECONNECT Route reconnect intervals.
+	// DEFAULT_ROUTE_CONNECT_MAX Route solicitation intervals (max).
+	DEFAULT_ROUTE_CONNECT_MAX = 30 * time.Second
+
+	// DEFAULT_ROUTE_RECONNECT Route reconnect delay.
 	DEFAULT_ROUTE_RECONNECT = 1 * time.Second
 
 	// DEFAULT_ROUTE_DIAL Route dial timeout.

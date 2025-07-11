@@ -132,6 +132,7 @@ const (
 // Can be changed for tests
 var (
 	routeConnectDelay    = DEFAULT_ROUTE_CONNECT
+	routeConnectMaxDelay = DEFAULT_ROUTE_CONNECT_MAX
 	routeMaxPingInterval = defaultRouteMaxPingInterval
 )
 
@@ -449,7 +450,8 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 	// Update statistics
 	c.in.msgs++
 	// The msg includes the CR_LF, so pull back out for accounting.
-	c.in.bytes += int32(len(msg) - LEN_CR_LF)
+	size := len(msg) - LEN_CR_LF
+	c.in.bytes += int32(size)
 
 	if c.opts.Verbose {
 		c.sendOK()
@@ -471,6 +473,13 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 		c.Debugf("Unknown account %q for routed message on subject: %q", c.pa.account, c.pa.subject)
 		return
 	}
+
+	acc.stats.Lock()
+	acc.stats.inMsgs++
+	acc.stats.inBytes += int64(size)
+	acc.stats.rt.inMsgs++
+	acc.stats.rt.inBytes += int64(size)
+	acc.stats.Unlock()
 
 	// Check for no interest, short circuit if so.
 	// This is the fanout scale.
@@ -2876,6 +2885,7 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 	excludedAddresses := s.routesToSelf
 	s.mu.RUnlock()
 
+	attemptDelay := routeConnectDelay
 	for attempts := 0; s.isRunning(); {
 		if tryForEver {
 			if !s.routeStillValid(rURL) {
@@ -2918,7 +2928,14 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 			select {
 			case <-s.quitCh:
 				return
-			case <-time.After(routeConnectDelay):
+			case <-time.After(attemptDelay):
+				if opts.Cluster.ConnectBackoff {
+					// Use exponential backoff for connection attempts.
+					attemptDelay *= 2
+					if attemptDelay > routeConnectMaxDelay {
+						attemptDelay = routeConnectMaxDelay
+					}
+				}
 				continue
 			}
 		}

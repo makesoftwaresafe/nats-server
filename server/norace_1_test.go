@@ -4646,10 +4646,11 @@ func TestNoRaceJetStreamRebuildDeDupeAndMemoryPerf(t *testing.T) {
 	require_NoError(t, err)
 
 	mset.mu.Lock()
-	mset.ddloaded = false
+	mset.ddMu.Lock()
 	start = time.Now()
 	mset.rebuildDedupe()
 	fmt.Printf("TOOK %v to rebuild dd\n", time.Since(start))
+	mset.ddMu.Unlock()
 	mset.mu.Unlock()
 
 	v, _ = s.Varz(nil)
@@ -4998,7 +4999,7 @@ func TestNoRaceJetStreamAccountLimitsAndRestart(t *testing.T) {
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$JS", "TEST")
 
-	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
 		return checkState(t, c, "$JS", "TEST")
 	})
 	for _, cs := range c.servers {

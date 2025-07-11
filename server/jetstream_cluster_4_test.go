@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"math/rand"
 	"os"
 	"path"
@@ -2462,10 +2463,10 @@ func TestJetStreamClusterPubAckSequenceDupeResetAfterLeaderChange(t *testing.T) 
 	require_NoError(t, err)
 
 	// Store one msg ID that needs to be preserved, and another that should be removed during leader change.
-	mset.mu.Lock()
+	mset.ddMu.Lock()
 	mset.storeMsgIdLocked(&ddentry{"genuine", 1, time.Now().UnixNano()})
 	mset.storeMsgIdLocked(&ddentry{"msgId", 0, time.Now().UnixNano()})
-	mset.mu.Unlock()
+	mset.ddMu.Unlock()
 
 	// Simulates the msg ID being in process.
 	_, err = js.Publish("foo", nil, nats.MsgId("msgId"))
@@ -2491,9 +2492,9 @@ func TestJetStreamClusterPubAckSequenceDupeResetAfterLeaderChange(t *testing.T) 
 	nsl := c.streamLeader(globalAccountName, "TEST")
 	require_True(t, nsl == sl)
 
-	mset.mu.Lock()
+	mset.ddMu.Lock()
 	lenDdmap, lenDdarr := len(mset.ddmap), len(mset.ddarr)
-	mset.mu.Unlock()
+	mset.ddMu.Unlock()
 	require_Len(t, lenDdmap, 1)
 	require_Len(t, lenDdarr, 1)
 
@@ -3528,8 +3529,118 @@ func TestJetStreamClusterConsumerDesyncAfterErrorDuringStreamCatchup(t *testing.
 	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
 
 	// Outdated server must NOT become the leader.
-	newConsummerLeaderServer := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
-	require_Equal(t, newConsummerLeaderServer.Name(), clusterResetServerName)
+	newConsumerLeaderServer := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_Equal(t, newConsumerLeaderServer.Name(), clusterResetServerName)
+}
+
+func TestJetStreamClusterDesyncAfterEofFromOldStreamLeader(t *testing.T) {
+	test := func(t *testing.T, eof bool) {
+		c := createJetStreamClusterExplicit(t, "R5S", 5)
+		defer c.shutdown()
+
+		cs := c.randomServer()
+		nc, js := jsClientConnect(t, cs)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: 5,
+		})
+		require_NoError(t, err)
+
+		sl := c.streamLeader(globalAccountName, "TEST")
+		var rs *Server
+		var catchup *Server
+		for _, s := range c.servers {
+			if s != sl && s != cs {
+				if rs == nil {
+					rs = s
+				} else {
+					catchup = s
+					break
+				}
+			}
+		}
+
+		// Shutdown server that needs to catch up, so it gets a snapshot from the leader after restart.
+		catchup.Shutdown()
+
+		// One message is received and applied by all replicas.
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			return checkState(t, c, globalAccountName, "TEST")
+		})
+
+		// Disable Raft and start cluster subs for server, simulating an old leader with an outdated log.
+		acc, err := rs.lookupAccount(globalAccountName)
+		require_NoError(t, err)
+		mset, err := acc.lookupStream("TEST")
+		require_NoError(t, err)
+		mset.startClusterSubs()
+		rn := mset.raftNode()
+		rn.Stop()
+		rn.WaitForStop()
+
+		// Temporarily disable cluster subs for this test.
+		// Normally due to multiple cluster subs responses will interleave, but this is simpler for this test.
+		acc, err = sl.lookupAccount(globalAccountName)
+		require_NoError(t, err)
+		mset, err = acc.lookupStream("TEST")
+		require_NoError(t, err)
+		mset.stopClusterSubs()
+
+		// Publish another message that the old leader will not get.
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+		require_NoError(t, sl.JetStreamSnapshotStream(globalAccountName, "TEST"))
+
+		sa := sl.getJetStream().streamAssignment(globalAccountName, "TEST")
+		require_NotNil(t, sa)
+
+		// Send EOF immediately to requesting server, otherwise the server needs to time out and retry.
+		if eof {
+			snc, err := nats.Connect(rs.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+			require_NoError(t, err)
+			defer snc.Close()
+
+			sub, err := snc.Subscribe(sa.Sync, func(msg *nats.Msg) {
+				// EOF
+				rs.sendInternalMsgLocked(msg.Reply, _EMPTY_, nil, nil)
+			})
+			require_NoError(t, err)
+			defer sub.Drain()
+		}
+
+		// Restart server so it starts catching up.
+		catchup = c.restartServer(catchup)
+
+		// Wait for server to start catching up.
+		// This shouldn't be a problem. The server should retry catchup, recognizing it wasn't caught up fully.
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			if a, err := catchup.lookupAccount(globalAccountName); err != nil {
+				return err
+			} else if m, err := a.lookupStream("TEST"); err != nil {
+				return err
+			} else if !m.isCatchingUp() {
+				return errors.New("stream not catching up")
+			}
+			return nil
+		})
+
+		// Stop old leader, and re-enable cluster subs on proper leader.
+		rs.Shutdown()
+		mset.startClusterSubs()
+
+		// Server should automatically restart catchup and get the missing data.
+		checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+			return checkState(t, c, globalAccountName, "TEST")
+		})
+	}
+
+	t.Run("eof", func(t *testing.T) { test(t, true) })
+	t.Run("retry", func(t *testing.T) { test(t, false) })
 }
 
 func TestJetStreamClusterReservedResourcesAccountingAfterClusterReset(t *testing.T) {
@@ -4664,6 +4775,86 @@ func TestJetStreamClusterExpectedPerSubjectConsistency(t *testing.T) {
 	require_Len(t, len(mset.expectedPerSubjectInProcess), 0)
 }
 
+func TestJetStreamClusterMsgCounterRunningTotalConsistency(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:            "TEST",
+		Subjects:        []string{"foo"},
+		Storage:         FileStorage,
+		Retention:       LimitsPolicy,
+		Replicas:        3,
+		AllowMsgCounter: true,
+	})
+	require_NoError(t, err)
+
+	s := c.streamLeader(globalAccountName, "TEST")
+	acc, err := s.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Running total should be kept up-to-date.
+	mset.clMu.Lock()
+	mset.clusteredCounterTotal = map[string]*msgCounterRunningTotal{
+		"foo": {total: big.NewInt(10), ops: 1},
+	}
+	mset.clMu.Unlock()
+	m := nats.NewMsg("foo")
+	m.Header.Set("Nats-Incr", "1")
+	pubAck, err := js.PublishMsg(m)
+	require_NoError(t, err)
+	require_Equal(t, pubAck.Sequence, 1)
+
+	rsm, err := js.GetLastMsg("TEST", "foo")
+	require_NoError(t, err)
+	require_Equal(t, rsm.Sequence, 1)
+	var count CounterValue
+	require_NoError(t, json.Unmarshal(rsm.Data, &count))
+	require_Equal(t, count.Value, "11")
+
+	// Confirm running total has properly been mutated.
+	total, ops := _EMPTY_, uint64(0)
+	mset.clMu.Lock()
+	if l := len(mset.clusteredCounterTotal); l != 1 {
+		mset.clMu.Unlock()
+		require_Len(t, l, 1)
+	}
+	if counter, ok := mset.clusteredCounterTotal["foo"]; !ok {
+		mset.clMu.Unlock()
+		t.Fatal("counter not found")
+	} else {
+		total = counter.total.String()
+		ops = counter.ops
+	}
+	mset.clMu.Unlock()
+	require_Equal(t, total, "11")
+	require_Equal(t, ops, 1)
+
+	// Reset. Running totals should be removed once all inflight counter operations are applied.
+	mset.clMu.Lock()
+	mset.clusteredCounterTotal = nil
+	mset.clMu.Unlock()
+	pubAck, err = js.PublishMsg(m)
+	require_NoError(t, err)
+	require_Equal(t, pubAck.Sequence, 2)
+
+	rsm, err = js.GetLastMsg("TEST", "foo")
+	require_NoError(t, err)
+	require_Equal(t, rsm.Sequence, 2)
+	require_NoError(t, json.Unmarshal(rsm.Data, &count))
+	require_Equal(t, count.Value, "12")
+
+	// Should be cleaned up after publish.
+	mset.clMu.Lock()
+	defer mset.clMu.Unlock()
+	require_Len(t, len(mset.clusteredCounterTotal), 0)
+}
+
 func TestJetStreamClusterConsistencyAfterLeaderChange(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -5572,7 +5763,7 @@ func TestJetStreamClusterParallelCreateRaftGroup(t *testing.T) {
 		go func() {
 			wg.Done()
 			defer finish.Done()
-			if n, rerr := sjs.createRaftGroup(acc.GetName(), rg, storage, pprofLabels{}); rerr == nil {
+			if n, rerr := sjs.createRaftGroup(acc.GetName(), rg, false, storage, pprofLabels{}); rerr == nil {
 				mu.Lock()
 				nodes = append(nodes, n)
 				mu.Unlock()
