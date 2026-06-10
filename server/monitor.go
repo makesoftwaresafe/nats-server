@@ -3192,7 +3192,7 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optDire
 						if !optCfg {
 							cInfo.Config = nil
 						}
-						sdet.DirectConsumer = append(sdet.Consumer, cInfo)
+						sdet.DirectConsumer = append(sdet.DirectConsumer, cInfo)
 					}
 				}
 			}

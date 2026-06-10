@@ -5507,9 +5507,26 @@ func TestMonitorJsz(t *testing.T) {
 				if len(info.AccountDetails) != 1 {
 					t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
 				}
-				if slices.ContainsFunc(info.AccountDetails[0].Streams, func(stream StreamDetail) bool {
-					return len(stream.DirectConsumer) > 0
-				}) {
+				for _, stream := range info.AccountDetails[0].Streams {
+					if len(stream.DirectConsumer) == 0 {
+						continue
+					}
+					if stream.Name != "my-stream-replicated" {
+						t.Fatalf("expected direct consumers only on the mirror origin stream, %s reported %d on %q",
+							url, len(stream.DirectConsumer), stream.Name)
+					}
+					if len(stream.DirectConsumer) != 1 {
+						t.Fatalf("expected exactly one direct consumer on %q but %s returned %d",
+							stream.Name, url, len(stream.DirectConsumer))
+					}
+					for _, dc := range stream.DirectConsumer {
+						if slices.ContainsFunc(stream.Consumer, func(c *ConsumerInfo) bool {
+							return c.Name == dc.Name
+						}) {
+							t.Fatalf("public consumer %q leaked into the direct consumer list of %q on %s",
+								dc.Name, stream.Name, url)
+						}
+					}
 					return nil
 				}
 			}
