@@ -3542,10 +3542,20 @@ func (n *raft) catchupFollower(ar *appendEntryResponse) {
 	n.progress[ar.peer] = indexUpdates
 	n.wg.Add(1)
 	n.Unlock()
-	n.s.startGoRoutine(func() {
+	started := n.s.startGoRoutine(func() {
 		defer n.wg.Done()
 		n.runCatchup(ar, indexUpdates)
 	})
+	if !started {
+		n.wg.Done()
+		n.Lock()
+		if n.progress != nil && n.progress[ar.peer] == indexUpdates {
+			delete(n.progress, ar.peer)
+		}
+		n.Unlock()
+		indexUpdates.unregister()
+		arPool.Put(ar)
+	}
 }
 
 func (n *raft) loadEntry(index uint64) (*appendEntry, error) {

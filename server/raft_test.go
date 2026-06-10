@@ -6933,3 +6933,55 @@ func TestNRGCatchupRerequestDoesNotOrphanProgressQueue(t *testing.T) {
 	n.RUnlock()
 	require_True(t, q == q2)
 }
+
+func TestNRGCatchupFollowerNoWaitGroupLeakWhenGoRoutineFails(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Store a single entry to the WAL so catchupFollower can load a valid starting entry
+	// and proceed to the point where it launches the catchup goroutine.
+	var scratch [1024]byte
+	n.Lock()
+	entries := []*Entry{newEntry(EntryNormal, []byte("hello"))}
+	ae := n.buildAppendEntry(entries)
+	buf, err := ae.encode(scratch[:])
+	require_NoError(t, err)
+	ae.buf = buf
+	err = n.storeToWAL(ae)
+	n.Unlock()
+	require_NoError(t, err)
+
+	// Simulate server shutdown: goroutines are no longer started.
+	s := n.s
+	s.grMu.Lock()
+	s.grRunning = false
+	s.grMu.Unlock()
+
+	// Ask to catch up a follower.
+	ar := newAppendEntryResponse(ae.term, 0, "follower-peer", true)
+	n.catchupFollower(ar)
+
+	// startGoRoutine returned false, so the catchup goroutine never ran. With the bug,
+	// the wg counter is still +1 (and progress/indexUpdates leaked). Verify Delete() (which
+	// does n.wg.Wait()) returns promptly instead of hanging forever.
+	done := make(chan struct{})
+	go func() {
+		n.Delete()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good: wg reached zero, no leak.
+	case <-time.After(2 * time.Second):
+		t.Fatal("raft.Delete() hung: n.wg leaked because startGoRoutine failed but wg.Done() was never called")
+	}
+
+	// Also confirm the per-catchup bookkeeping was cleaned up.
+	n.RLock()
+	_, progressLeaked := n.progress["follower-peer"]
+	n.RUnlock()
+	if progressLeaked {
+		t.Fatal("progress map entry for the follower leaked after failed catchup")
+	}
+}
