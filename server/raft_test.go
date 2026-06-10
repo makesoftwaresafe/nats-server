@@ -245,6 +245,21 @@ func TestNRGInlineStepdown(t *testing.T) {
 	require_NotEqual(t, n.State(), Leader)
 }
 
+func TestNRGMalformedAppendEntryResponse(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createMemRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	n := rg.leader().node().(*raft)
+
+	// A message whose length does not match appendEntryResponseLen decodes to
+	// nil. This must not cause a nil pointer dereference/panic.
+	n.handleAppendEntryResponse(nil, nil, nil, "subject", "reply", []byte{})
+	n.handleAppendEntryResponse(nil, nil, nil, "subject", "reply", []byte{1, 2, 3})
+}
+
 func TestNRGObserverMode(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()

@@ -4669,6 +4669,10 @@ func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
 // handleAppendEntryResponse processes responses to append entries.
 func (n *raft) handleAppendEntryResponse(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
 	ar := decodeAppendEntryResponse(msg)
+	if ar == nil {
+		n.error("Received malformed append entry response")
+		return
+	}
 	ar.reply = reply
 	n.resp.push(ar)
 }
