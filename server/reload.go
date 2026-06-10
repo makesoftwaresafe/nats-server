@@ -2101,7 +2101,10 @@ func (s *Server) resetInternalLoopInfo() {
 	s.mu.Unlock()
 
 	if resetCh != nil {
-		resetCh <- struct{}{}
+		select {
+		case resetCh <- struct{}{}:
+		case <-s.quitCh:
+		}
 	}
 }
 
@@ -2295,7 +2298,10 @@ func (s *Server) reloadAuthorization() {
 	}
 
 	if resetCh != nil {
-		resetCh <- struct{}{}
+		select {
+		case resetCh <- struct{}{}:
+		case <-s.quitCh:
+		}
 	}
 
 	// Close clients that have moved accounts

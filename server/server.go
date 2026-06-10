@@ -1041,7 +1041,10 @@ func (s *Server) setClusterName(name string) {
 		l.closeConnection(ClusterNameConflict)
 	}
 	if resetCh != nil {
-		resetCh <- struct{}{}
+		select {
+		case resetCh <- struct{}{}:
+		case <-s.quitCh:
+		}
 	}
 	s.Noticef("Cluster name updated to %s", name)
 }
