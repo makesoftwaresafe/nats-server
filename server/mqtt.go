@@ -243,6 +243,7 @@ var (
 	errMQTTInvalidSession             = errors.New("invalid MQTT session")
 	errMQTTInvalidRetainFlags         = errors.New("invalid retained message flags")
 	errMQTTSessionCollision           = errors.New("stored session does not match client ID")
+	errMQTTInvalidPublishLength       = errors.New("invalid publish message, variable header exceeds remaining length")
 )
 
 type srvMQTT struct {
@@ -4129,8 +4130,10 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 		start = r.pos
 		r.pos += pp.sz
 		pp.msg = r.buf[start:r.pos]
-	} else {
+	} else if pp.sz == 0 {
 		pp.msg = nil
+	} else {
+		return errMQTTInvalidPublishLength
 	}
 	return nil
 }

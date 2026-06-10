@@ -2413,6 +2413,7 @@ func TestMQTTParsePub(t *testing.T) {
 		{"topic with null byte", 0, []byte{0, 3, 'f', 0, 'o'}, 5, "", true},
 		{"error on packet identifier", mqttPubQos1, []byte{0, 3, 'f', 'o', 'o'}, 5, "packet identifier", false},
 		{"invalid packet identifier", mqttPubQos1, []byte{0, 3, 'f', 'o', 'o', 0, 0}, 7, errMQTTPacketIdentifierIsZero.Error(), false},
+		{"topic exceeds remaining length", 0, []byte{0, 5, 'f', 'o', 'o', 'b', 'a'}, 2, errMQTTInvalidPublishLength.Error(), false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mqttReader{}
