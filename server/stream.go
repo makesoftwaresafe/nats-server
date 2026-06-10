@@ -2424,23 +2424,24 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 	oldMaxAckPending, newMaxAckPending := ocfg.ConsumerLimits.MaxAckPending, cfg.ConsumerLimits.MaxAckPending
 	updateLimits := (newInactiveThreshold > 0 && oldInactiveThreshold != newInactiveThreshold) ||
 		(newMaxAckPending > 0 && oldMaxAckPending != newMaxAckPending)
-	if updateLimits {
+
+	// Only check if not clustered. The meta leader performs clustered checks.
+	if updateLimits && !mset.js.isClustered() {
 		var errorConsumers []string
-		consumers := map[string]*ConsumerConfig{}
-		if mset.js.isClustered() {
-			for _, c := range mset.sa.consumers {
-				consumers[c.Name] = c.Config
-			}
-		} else {
-			for _, c := range mset.consumers {
-				consumers[c.name] = &c.cfg
-			}
+		mset.mu.RLock()
+		clist := make([]*consumer, 0, len(mset.consumers))
+		for _, c := range mset.consumers {
+			clist = append(clist, c)
 		}
-		for name, ccfg := range consumers {
+		mset.mu.RUnlock()
+		for _, c := range clist {
+			c.mu.RLock()
+			name, ccfg := c.name, c.cfg
 			if (newInactiveThreshold > 0 && ccfg.InactiveThreshold > newInactiveThreshold) ||
 				(newMaxAckPending > 0 && ccfg.MaxAckPending > newMaxAckPending) {
 				errorConsumers = append(errorConsumers, name)
 			}
+			c.mu.RUnlock()
 		}
 		if len(errorConsumers) > 0 {
 			// TODO(nat): Return a parsable error so that we can surface something
