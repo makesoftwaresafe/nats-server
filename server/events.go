@@ -2228,7 +2228,7 @@ func (s *Server) statszReq(sub *subscription, c *client, _ *Account, subject, re
 	// No reply is a signal that we should use our normal broadcast subject.
 	if reply == _EMPTY_ {
 		reply = fmt.Sprintf(serverStatsSubj, s.info.ID)
-		s.wrapChk(s.resetLastStatsz)
+		s.wrapChk(s.resetLastStatsz)()
 	}
 
 	opts := StatszEventOptions{}
