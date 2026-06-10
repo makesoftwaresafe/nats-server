@@ -14604,3 +14604,118 @@ func TestFileStoreStoreRawMsgTTLsRace(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// Must be run with -race.
+func TestFileStoreSyncDeletedDmapAliasRace(t *testing.T) {
+	fcfg := FileStoreConfig{
+		StoreDir:  t.TempDir(),
+		BlockSize: 1024, // small on purpose to create many blocks
+	}
+	fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Store enough messages across many blocks.
+	subj := "foo"
+	msg := bytes.Repeat([]byte("Z"), 50)
+	const total = 600
+	for range total {
+		_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+	}
+
+	// Create interior deletes so mb.dmap is non-empty in many blocks.
+	for seq := uint64(2); seq <= total-1; seq += 3 {
+		_, err = fs.RemoveMsg(seq)
+		require_NoError(t, err)
+	}
+
+	// Compact each non-last block so the removed records are physically dropped
+	// from disk, leaving real holes. This way a later reload via indexCacheBuf
+	// must reconstruct the holes with mb.dmap.Insert (the racy writer).
+	fs.mu.RLock()
+	cblks := append([]*msgBlock(nil), fs.blks...)
+	fs.mu.RUnlock()
+	for _, mb := range cblks[:len(cblks)-1] {
+		mb.mu.Lock()
+		err = mb.compact()
+		mb.mu.Unlock()
+		require_NoError(t, err)
+	}
+
+	// Snapshot the delete blocks to feed back into SyncDeleted.
+	fs.mu.Lock()
+	fs.readLockAllMsgBlocks()
+	live := fs.deleteBlocks()
+	dbs := make(DeleteBlocks, len(live))
+	for i, db := range live {
+		switch d := db.(type) {
+		case *avl.SequenceSet:
+			dbs[i] = d.Clone()
+		case *DeleteRange:
+			cp := *d
+			dbs[i] = &cp
+		default:
+			dbs[i] = db
+		}
+	}
+	fs.readUnlockAllMsgBlocks()
+	fs.mu.Unlock()
+	require_True(t, len(dbs) > 0)
+
+	// Grab a snapshot of the blocks so the loader goroutine can force cache expiry.
+	fs.mu.RLock()
+	blks := append([]*msgBlock(nil), fs.blks...)
+	fs.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Several reader goroutines continuously SyncDeleted, which traverses live
+	// mb.dmap via pruneDeleteBlock without holding mb.mu.
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = fs.SyncDeleted(dbs)
+			}
+		}()
+	}
+
+	// Several writer goroutines reload blocks, driving indexCacheBuf to Insert
+	// into mb.dmap under mb.mu only. A lock-free dmap traversal in SyncDeleted
+	// should trigger the race without a fix.
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, mb := range blks {
+					mb.mu.Lock()
+					mb.tryForceExpireCacheLocked()
+					_ = mb.loadMsgsWithLock()
+					mb.mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// Run briefly; the race detector should trip quickly.
+	time.Sleep(2 * time.Second)
+	close(stop)
+	wg.Wait()
+
+	// Sanity: store still usable.
+	_ = fs.State()
+}

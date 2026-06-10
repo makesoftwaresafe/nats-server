@@ -12468,6 +12468,13 @@ func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) error {
 	lseq := fs.state.LastSeq
 	fs.readLockAllMsgBlocks()
 	mdbs := fs.deleteBlocks()
+	// We'll release the locks below, so need to copy the ones that are references
+	// which are only safe while the locks are still held.
+	for i, db := range mdbs {
+		if ss, ok := db.(*avl.SequenceSet); ok {
+			mdbs[i] = ss.Clone()
+		}
+	}
 	fs.readUnlockAllMsgBlocks()
 
 	for _, db := range dbs {
