@@ -24513,3 +24513,66 @@ func TestJetStreamInterestStreamNoInterestSkipAdvancesLastTime(t *testing.T) {
 	t.Run("Memory", func(t *testing.T) { test(t, nats.MemoryStorage) })
 	t.Run("File", func(t *testing.T) { test(t, nats.FileStorage) })
 }
+
+// Must be run with -race.
+func TestJetStreamStreamConfigSourcesDataRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader: continuously copy the whole config (reads Sources slice header)
+	// under mset.cfgMu.RLock.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			cfg := mset.config()
+			_ = len(cfg.Sources)
+		}
+	}()
+
+	// Writer: drive updates that add a brand new Source each iteration, which
+	// hits the `mset.cfg.Sources = append(...)` mutation under mset.mu only.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(stop)
+		for i := range 200 {
+			cfg := mset.config()
+			cfg.Sources = append(cfg.Sources, &StreamSource{Name: fmt.Sprintf("SRC_%d", i)})
+			if err := mset.updateWithAdvisory(&cfg, false, false); err != nil {
+				// Don't fail the test on update errors (sources point at
+				// non-existent streams); we only care about the mutation race.
+				return
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(stop)
+		t.Fatal("timeout")
+	}
+}
