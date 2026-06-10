@@ -4192,3 +4192,27 @@ func TestAccountServiceImportReplyDroppedAcrossClusterRoutes(t *testing.T) {
 		t.Fatal("reverse reply not received — service import reply was dropped across cluster routes")
 	}
 }
+
+func TestStreamActivationExpiredNoMatchDoesNotInvalidate(t *testing.T) {
+	// Account performing the import.
+	a := NewAccount("importer")
+	// The account we will pass as the (non-matching) export account.
+	exportAcc := NewAccount("exporter")
+	// A different, still-valid stream import that does NOT match the
+	// (exportAcc, subject) pair passed to streamActivationExpired.
+	otherAcc := NewAccount("other")
+	si := &streamImport{
+		acc:  otherAcc,
+		from: "other.subject",
+		// claim is nil, so checkActivation would return false and the
+		// buggy code would wrongly mark this import invalid.
+		claim: nil,
+	}
+	a.imports.streams = []*streamImport{si}
+
+	// No matching import.
+	a.streamActivationExpired(exportAcc, "nomatch.subject")
+	if si.invalid {
+		t.Fatalf("unrelated stream import was wrongly invalidated on no match")
+	}
+}
