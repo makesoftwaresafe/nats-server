@@ -120,7 +120,7 @@ func testMQTTReadPacket(t testing.TB, r *mqttReader) (byte, int) {
 			t.Fatalf("Error reading packet: %v", err)
 		}
 		var complete bool
-		pl, complete, err = r.readPacketLen()
+		pl, complete, err = r.readPacketLen(MAX_PAYLOAD_SIZE)
 		if err != nil {
 			t.Fatalf("Error reading packet: %v", err)
 		}
@@ -196,7 +196,7 @@ func TestMQTTReader(t *testing.T) {
 	}
 
 	r.reset([]byte{0x82, 0xff, 0x3})
-	l, _, err := r.readPacketLenWithCheck(false)
+	l, _, err := r.readVarInt()
 	if err != nil {
 		t.Fatal("error getting packet len")
 	}
@@ -204,7 +204,7 @@ func TestMQTTReader(t *testing.T) {
 		t.Fatalf("expected length 0xff82 got 0x%x", l)
 	}
 	r.reset([]byte{0xff, 0xff, 0xff, 0xff, 0xff})
-	if _, _, err := r.readPacketLenWithCheck(false); err == nil || !strings.Contains(err.Error(), "malformed") {
+	if _, _, err := r.readVarInt(); err == nil || !strings.Contains(err.Error(), "malformed") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -219,7 +219,7 @@ func TestMQTTReader(t *testing.T) {
 		if pt := b & mqttPacketMask; pt != mqttPacketPub {
 			t.Fatalf("Unexpected byte: %v", b)
 		}
-		pl, complete, err := r.readPacketLen()
+		pl, complete, err := r.readPacketLen(MAX_PAYLOAD_SIZE)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -298,11 +298,57 @@ func TestMQTTWriter(t *testing.T) {
 
 	r.reset(w.Bytes())
 	for _, v := range ints {
-		x, _, _ := r.readPacketLenWithCheck(false)
+		x, _, _ := r.readVarInt()
 		if v != x {
 			t.Fatalf("expected %d, got %d", v, x)
 		}
 	}
+}
+
+func TestMQTTIncompleteConnectMaxPayloadViolationDisconnects(t *testing.T) {
+	const maxPayload = 1024
+	const remainingLength = maxPayload + 1
+
+	o := testMQTTDefaultOptions()
+	o.MaxPayload = maxPayload
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, err := net.Dial("tcp", net.JoinHostPort(o.MQTT.Host, fmt.Sprintf("%d", o.MQTT.Port)))
+	require_NoError(t, err)
+	defer c.Close()
+
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketConnect)
+	w.WriteVarInt(remainingLength)
+	w.Write(bytes.Repeat([]byte{'A'}, maxPayload))
+
+	_, err = testMQTTWrite(c, w.Bytes())
+	require_NoError(t, err)
+
+	testMQTTExpectDisconnect(t, c)
+}
+
+func TestMQTTPacketLenMaxPayloadViolation(t *testing.T) {
+	const maxPayload = 1024
+
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketConnect)
+	w.WriteVarInt(maxPayload)
+	w.Write(bytes.Repeat([]byte{'A'}, maxPayload))
+
+	r := &mqttReader{}
+	r.reset(w.Bytes())
+	r.pstart = r.pos
+
+	_, err := r.readByte("packet type")
+	require_NoError(t, err)
+
+	packetLen, complete, err := r.readPacketLen(maxPayload)
+	require_Error(t, err, ErrMaxPayload)
+	require_False(t, complete)
+	require_Equal(t, packetLen, w.Len())
+	require_Equal(t, len(r.pbuf), 0)
 }
 
 func testMQTTDefaultOptions() *Options {
@@ -8332,6 +8378,25 @@ func TestMQTTMaxPayloadEnforced(t *testing.T) {
 	testMQTTSendPublishPacket(t, mc, 0, false, false, "foo", 0, oversized)
 
 	testMQTTExpectDisconnect(t, mc)
+}
+
+func TestMQTTMaxPayloadDoesNotCapPublishTopic(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		server_name: test_mqtt_max_payload_topic
+		port: -1
+		max_payload: 1024
+		mqtt { listen: "127.0.0.1:-1" }
+		jetstream: { domain: "TEST", max_mem_store: 8MB, max_file_store: 8MB, store_dir: "`+t.TempDir()+`" }
+	`))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{clientID: "cid", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSendPublishPacket(t, mc, 0, false, false, strings.Repeat("a", 1100), 0, nil)
+	testMQTTFlush(t, mc, nil, r)
 }
 
 func TestMQTTJSApiMapping(t *testing.T) {

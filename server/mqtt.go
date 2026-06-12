@@ -794,8 +794,15 @@ func (c *client) mqttParse(buf []byte) error {
 			break
 		}
 
-		pl, complete, err = r.readPacketLen()
+		maxLen := int32(jwt.NoLimit)
+		if !connected {
+			maxLen = atomic.LoadInt32(&c.mpay)
+		}
+		pl, complete, err = r.readPacketLen(maxLen)
 		if err != nil || !complete {
+			if err == ErrMaxPayload {
+				c.maxPayloadViolation(pl, maxLen)
+			}
 			break
 		}
 		if err = mqttCheckRemainingLength(pt, pl); err != nil {
@@ -5844,11 +5851,27 @@ func (r *mqttReader) readByte(field string) (byte, error) {
 	return b, nil
 }
 
-func (r *mqttReader) readPacketLen() (int, bool, error) {
-	return r.readPacketLenWithCheck(true)
+func (r *mqttReader) readPacketLen(maxLen int32) (int, bool, error) {
+	v, complete, err := r.readVarInt()
+	if err != nil {
+		return 0, false, err
+	}
+	if complete {
+		packetEnd := r.pos + v
+		packetLen := packetEnd - r.pstart
+		if maxLen != jwt.NoLimit && int64(packetLen) > int64(maxLen) {
+			return packetLen, false, ErrMaxPayload
+		}
+		if packetEnd <= len(r.buf) {
+			return v, true, nil
+		}
+	}
+	r.pbuf = make([]byte, len(r.buf)-r.pstart)
+	copy(r.pbuf, r.buf[r.pstart:])
+	return 0, false, nil
 }
 
-func (r *mqttReader) readPacketLenWithCheck(check bool) (int, bool, error) {
+func (r *mqttReader) readVarInt() (int, bool, error) {
 	m := 1
 	v := 0
 	for {
@@ -5861,9 +5884,6 @@ func (r *mqttReader) readPacketLenWithCheck(check bool) (int, bool, error) {
 		}
 		v += int(b&0x7f) * m
 		if (b & 0x80) == 0 {
-			if check && r.pos+v > len(r.buf) {
-				break
-			}
 			return v, true, nil
 		}
 		m *= 0x80
@@ -5871,8 +5891,6 @@ func (r *mqttReader) readPacketLenWithCheck(check bool) (int, bool, error) {
 			return 0, false, errMQTTMalformedVarInt
 		}
 	}
-	r.pbuf = make([]byte, len(r.buf)-r.pstart)
-	copy(r.pbuf, r.buf[r.pstart:])
 	return 0, false, nil
 }
 
