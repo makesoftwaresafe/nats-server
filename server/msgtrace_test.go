@@ -3783,6 +3783,183 @@ func TestMsgTraceResponsesServiceImportDifferentOrder(t *testing.T) {
 	}
 }
 
+func TestMsgTraceResponsesServiceImportPermissions(t *testing.T) {
+	tmpl := `
+		listen: 127.0.0.1:-1
+		server_name: "%s"
+		accounts {
+			A: {
+				users: [
+					{
+						user: "a",
+						password: "pwd",
+						permissions: {publish: ["a.>"], allow_responses=true}
+					}
+				]
+				exports: [ { service: "a.>", allow_trace: true} ]
+			}
+			B: {
+				users: [
+					{
+						user: "b",
+						password: "pwd",
+						permissions: {publish: ["b.>", "my.trace"]}
+					}
+				]
+				imports: [ {service: { account: A, subject: "a.>" }, to: "b.>"} ]
+			}
+		}
+		cluster {
+			name: "local"
+			listen: "127.0.0.1:-1"
+			permissions {
+				publish: ["interest", "a.>", "b.>", "my.trace"%s]
+			}
+			%s
+		}
+	`
+	confa := createConfFile(t, fmt.Appendf(nil, tmpl, "A", `, "_R_.>"`, _EMPTY_))
+	sa, sao := RunServerWithConfig(confa)
+	defer sa.Shutdown()
+
+	routes := fmt.Sprintf(`routes: ["nats://127.0.0.1:%d"]`, sao.Cluster.Port)
+	confb := createConfFile(t, fmt.Appendf(nil, tmpl, "B", `, "_R_.>"`, routes))
+	sb, _ := RunServerWithConfig(confb)
+	defer sb.Shutdown()
+
+	checkClusterFormed(t, sa, sb)
+
+	ncSvc := natsConnect(t, sb.ClientURL(), nats.UserInfo("a", "pwd"), nats.Name("Service"))
+	defer ncSvc.Close()
+	sub := natsSubSync(t, ncSvc, "a.>")
+	// Just to check interest propagation
+	natsSubSync(t, ncSvc, "interest")
+	natsFlush(t, ncSvc)
+
+	checkSubInterest(t, sa, "A", "interest", time.Second)
+
+	nc := natsConnect(t, sa.ClientURL(), nats.UserInfo("b", "pwd"), nats.Name("Requestor"))
+	defer nc.Close()
+
+	tsub := natsSubSync(t, nc, "my.trace")
+	rsub := natsSubSync(t, nc, "reply")
+	// Just to check interest propagation
+	natsSubSync(t, nc, "interest")
+	natsFlush(t, nc)
+
+	checkSubInterest(t, sb, "B", "interest", time.Second)
+
+	msg := nats.NewMsg("b.1")
+	msg.Header.Set(MsgTraceDest, tsub.Subject)
+	msg.Data = []byte("request")
+	msg.Reply = rsub.Subject
+
+	err := nc.PublishMsg(msg)
+	require_NoError(t, err)
+
+	smsg := natsNexMsg(t, sub, time.Second)
+	require_Equal(t, "request", string(smsg.Data))
+	err = smsg.Respond([]byte("reply"))
+	require_NoError(t, err)
+
+	rmsg := natsNexMsg(t, rsub, time.Second)
+	require_Equal(t, "reply", string(rmsg.Data))
+
+	for range 2 {
+		tmsg := natsNexMsg(t, tsub, time.Second)
+		var e *MsgTraceEvent
+		err = json.Unmarshal(tmsg.Data, &e)
+		require_NoError(t, err)
+
+		ingress := e.Ingress()
+		require_True(t, ingress != nil)
+
+		switch ingress.Kind {
+		case CLIENT:
+			require_Equal(t, e.Server.Name, "A")
+			require_Equal(t, ingress.Name, "Requestor")
+
+			sis := e.ServiceImports()
+			require_Len(t, len(sis), 1)
+			si := sis[0]
+			require_Equal(t, si.Account, "A")
+			require_Equal(t, si.From, "b.1")
+			require_Equal(t, si.To, "a.1")
+
+			egs := e.Egresses()
+			require_Len(t, len(egs), 1)
+			eg := egs[0]
+			require_Equal(t, eg.Kind, ROUTER)
+			require_Equal(t, eg.Name, "B")
+			require_Equal(t, eg.Hop, "1")
+		case ROUTER:
+			require_Equal(t, e.Server.Name, "B")
+			require_Equal(t, ingress.Name, "A")
+			require_Equal(t, ingress.Account, "A")
+			require_Equal(t, ingress.Subject, "a.1")
+
+			hdrs := e.Request.Header[MsgTraceDest]
+			require_Len(t, len(hdrs), 1)
+			td := hdrs[0]
+			require_True(t, td != _EMPTY_)
+			require_NotEqual(t, td, tsub.Subject)
+
+			hdrs = e.Request.Header[MsgTraceHop]
+			require_Len(t, len(hdrs), 1)
+			hop := hdrs[0]
+			require_Equal(t, hop, "1")
+
+			egs := e.Egresses()
+			require_Len(t, len(egs), 1)
+			eg := egs[0]
+			require_Equal(t, eg.Kind, CLIENT)
+			require_Equal(t, eg.Name, "Service")
+			require_Equal(t, eg.Subscription, "a.>")
+		default:
+			t.Fatalf("Unexpected ingress: %+v", e)
+		}
+	}
+
+	if tmsg, err := tsub.NextMsg(100 * time.Millisecond); err != nats.ErrTimeout {
+		if err == nil {
+			t.Fatalf("Unexpected message=%s", tmsg.Data)
+		} else {
+			t.Fatalf("Unexpected error=%v", err)
+		}
+	}
+
+	reloadUpdateConfig(t, sa, confa, fmt.Sprintf(tmpl, "A", _EMPTY_, _EMPTY_))
+	reloadUpdateConfig(t, sb, confb, fmt.Sprintf(tmpl, "B", _EMPTY_, routes))
+
+	l := &captureErrorLogger{errCh: make(chan string, 10)}
+	sb.SetLogger(l, false, false)
+
+	err = nc.PublishMsg(msg)
+	require_NoError(t, err)
+
+	if smsg, err := sub.NextMsg(100 * time.Millisecond); err != nats.ErrTimeout {
+		if err == nil {
+			t.Fatalf("Unexpected message=%s", smsg.Data)
+		} else {
+			t.Fatalf("Unexpected error=%v", err)
+		}
+	}
+
+	tm := time.NewTimer(time.Second)
+	defer tm.Stop()
+	for {
+		select {
+		case errStr := <-l.errCh:
+			if strings.Contains(errStr, "Publish Violation") {
+				// OK!
+				return
+			}
+		case <-tm.C:
+			t.Fatal("Timeout waiting for error in log")
+		}
+	}
+}
+
 func TestMsgTraceRejectsOriginAccountHeader(t *testing.T) {
 	hubTmpl := `
 		listen: 127.0.0.1:-1
