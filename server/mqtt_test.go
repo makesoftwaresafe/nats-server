@@ -5093,6 +5093,93 @@ func TestMQTTPermissionsViolation(t *testing.T) {
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/baz", qos: 1}}, []byte{mqttSubAckFailure})
 }
 
+func TestMQTTSubscribeDenyRetainedAndQoSReplay(t *testing.T) {
+	// A subscriber can be allowed to subscribe to a broad wildcard while being
+	// denied delivery of more specific subjects. Normal live delivery applies
+	// the deny filter (deliverMsg -> checkDenySub), but retained-message
+	// serialization and QoS1+ durable replay must apply it too.
+	o := testMQTTDefaultOptions()
+	o.Users = []*User{
+		{
+			Username: "pub",
+			Password: "pass",
+			Permissions: &Permissions{
+				Publish:   &SubjectPermission{Allow: []string{"secret.>", "foo.>"}},
+				Subscribe: &SubjectPermission{Allow: []string{"_INBOX.>"}},
+			},
+		},
+		{
+			Username: "sub",
+			Password: "pass",
+			Permissions: &Permissions{
+				Subscribe: &SubjectPermission{Allow: []string{">"}, Deny: []string{"secret.>"}},
+			},
+		},
+	}
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	pub := &mqttConnInfo{clientID: "pub", user: "pub", pass: "pass", cleanSess: true}
+	mp, rp := testMQTTConnect(t, pub, o.MQTT.Host, o.MQTT.Port)
+	defer mp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// 1) Live delivery: the denied subject must not be delivered, but an allowed
+	// subject on the same broad wildcard subscription must.
+	subLive := &mqttConnInfo{clientID: "sub-live", user: "sub", pass: "pass", cleanSess: true}
+	mc, rc := testMQTTConnect(t, subLive, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "#", qos: 0}}, []byte{0})
+	testMQTTPublish(t, mp, rp, 0, false, false, "secret/one", 0, []byte("live-denied"))
+	testMQTTExpectNothing(t, rc)
+	testMQTTPublish(t, mp, rp, 0, false, false, "foo/live", 0, []byte("live-allowed"))
+	testMQTTCheckPubMsg(t, mc, rc, "foo/live", 0, []byte("live-allowed"))
+	testMQTTDisconnect(t, mc, nil)
+	mc.Close()
+
+	// 2) QoS1 durable replay: subscribe with a persistent session, disconnect,
+	// publish a denied and an allowed QoS1 message while offline, then reconnect.
+	// The denied subject must not be replayed; the allowed one must.
+	persist := &mqttConnInfo{clientID: "persist-sub", user: "sub", pass: "pass", cleanSess: false}
+	mc, rc = testMQTTConnect(t, persist, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "#", qos: 1}}, []byte{1})
+	testMQTTDisconnect(t, mc, nil)
+	mc.Close()
+
+	// secret.one is published first so that, without the deny check, it would be
+	// the first message replayed (i.e. the bypass would be observed here).
+	testMQTTPublish(t, mp, rp, 1, false, false, "secret/one", 1, []byte("qos1-denied"))
+	testMQTTPublish(t, mp, rp, 1, false, false, "foo/replay", 2, []byte("qos1-allowed"))
+
+	mc, rc = testMQTTConnect(t, persist, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, true)
+	// Only the allowed message is replayed; the denied one is filtered out (and
+	// acked so JetStream does not keep redelivering it) before delivery.
+	testMQTTCheckPubMsg(t, mc, rc, "foo/replay", mqttPubQos1, []byte("qos1-allowed"))
+	testMQTTExpectNothing(t, rc)
+	testMQTTDisconnect(t, mc, nil)
+	mc.Close()
+
+	// 3) Retained delivery: a retained denied subject must not be serialized to a
+	// new subscriber, but a retained allowed subject must.
+	testMQTTPublish(t, mp, rp, 0, false, true, "secret/one", 0, []byte("retained-denied"))
+	testMQTTPublish(t, mp, rp, 0, false, true, "foo/ret", 0, []byte("retained-allowed"))
+	testMQTTFlush(t, mp, nil, rp)
+
+	subRet := &mqttConnInfo{clientID: "sub-retained", user: "sub", pass: "pass", cleanSess: true}
+	mc, rc = testMQTTConnect(t, subRet, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "#", qos: 0}}, []byte{0})
+	// Only the allowed retained message is delivered (with the RETAIN flag set).
+	testMQTTCheckPubMsg(t, mc, rc, "foo/ret", mqttPubFlagRetain, []byte("retained-allowed"))
+	testMQTTExpectNothing(t, rc)
+}
+
 func TestMQTTCleanSession(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
